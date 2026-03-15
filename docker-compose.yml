@@ -1,0 +1,150 @@
+version: "3.8"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/01-init.sql
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    ports:
+      - "5432:5432"
+
+  zitadel:
+    image: ghcr.io/zitadel/zitadel:latest
+    # Must run as root to write PAT file to the mounted volume
+    user: "0"
+    command: start-from-init --masterkey "MasterkeyNeedsToHave32Characters" --tlsMode disabled
+    environment:
+      ZITADEL_DATABASE_POSTGRES_HOST: postgres
+      ZITADEL_DATABASE_POSTGRES_PORT: 5432
+      ZITADEL_DATABASE_POSTGRES_DATABASE: zitadel
+      ZITADEL_DATABASE_POSTGRES_USER_USERNAME: zitadel
+      ZITADEL_DATABASE_POSTGRES_USER_PASSWORD: zitadel
+      ZITADEL_DATABASE_POSTGRES_USER_SSL_MODE: disable
+      ZITADEL_DATABASE_POSTGRES_ADMIN_USERNAME: postgres
+      ZITADEL_DATABASE_POSTGRES_ADMIN_PASSWORD: postgres
+      ZITADEL_DATABASE_POSTGRES_ADMIN_SSL_MODE: disable
+      # External access — must match what the browser uses (localhost:8080)
+      ZITADEL_EXTERNALSECURE: "false"
+      ZITADEL_EXTERNALPORT: 8080
+      ZITADEL_EXTERNALDOMAIN: localhost
+      # Machine service account + PAT written to shared volume on first run.
+      # Requires the three ORG_MACHINE_* companions to actually create the account.
+      ZITADEL_FIRSTINSTANCE_PATPATH: /pat/admin.pat
+      ZITADEL_FIRSTINSTANCE_ORG_MACHINE_MACHINE_USERNAME: setup-admin
+      ZITADEL_FIRSTINSTANCE_ORG_MACHINE_MACHINE_NAME: Setup Admin
+      ZITADEL_FIRSTINSTANCE_ORG_MACHINE_PAT_EXPIRATIONDATE: "9999-01-01T00:00:00Z"
+      # Human admin for Console UI access
+      ZITADEL_FIRSTINSTANCE_ORG_HUMAN_USERNAME: admin
+      ZITADEL_FIRSTINSTANCE_ORG_HUMAN_PASSWORD: "Password1!"
+      ZITADEL_FIRSTINSTANCE_ORG_HUMAN_EMAIL_ADDRESS: admin@poc.local
+      ZITADEL_FIRSTINSTANCE_ORG_HUMAN_EMAIL_VERIFIED: "true"
+      ZITADEL_FIRSTINSTANCE_ORG_HUMAN_PASSWORDCHANGEREQUIRED: "false"
+      # Allow Actions to call internal Docker services (role-validator)
+      ZITADEL_ACTIONS_HTTP_DENYLIST: ""
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # No healthcheck — distroless image has no usable health tool.
+    # 'zitadel ready' checks gRPC liveness which doesn't pass in this minimal setup.
+    # The setup script polls /debug/healthz over HTTP instead.
+    ports:
+      - "8080:8080"
+    volumes:
+      - zitadel_pat:/pat
+
+  role-validator:
+    build: ./role-validator
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/app
+      PORT: 3000
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/health || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    ports:
+      - "3000:3000"
+
+  # Phase 1: Zitadel config + DB seed. Must complete before Hasura starts
+  # because it registers 'zitadel' as a secondary domain so Hasura's JWK fetch works.
+  setup:
+    image: node:20-alpine
+    working_dir: /app
+    volumes:
+      - ./scripts:/app
+      - ./zitadel:/zitadel
+      - zitadel_pat:/pat
+      - ./frontend:/frontend
+    environment:
+      ZITADEL_DOMAIN: http://zitadel:8080
+      APP_DB_URL: postgres://postgres:postgres@postgres:5432/app
+    command: sh -c "npm install --prefer-offline && node setup-zitadel.js"
+    depends_on:
+      zitadel:
+        condition: service_started
+      role-validator:
+        condition: service_healthy
+
+  # Thin nginx proxy that rewrites Host: <anything> → Host: localhost:8080 before
+  # forwarding to Zitadel. Allows Docker services to reach Zitadel without needing
+  # to know or send the correct EXTERNALDOMAIN in the Host header.
+  zitadel-proxy:
+    image: nginx:alpine
+    volumes:
+      - ./nginx/zitadel-proxy.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - zitadel
+
+  hasura:
+    image: hasura/graphql-engine:v2.38.0
+    environment:
+      HASURA_GRAPHQL_DATABASE_URL: postgres://postgres:postgres@postgres:5432/app
+      HASURA_GRAPHQL_ENABLE_CONSOLE: "true"
+      HASURA_GRAPHQL_ADMIN_SECRET: adminsecret
+      HASURA_GRAPHQL_UNAUTHORIZED_ROLE: anonymous
+      # JWK endpoint goes via zitadel-proxy which corrects the Host header.
+      HASURA_GRAPHQL_JWT_SECRET: '{"type":"RS256","jwk_url":"http://zitadel-proxy:8081/oauth/v2/keys","claims_namespace":"https://hasura.io/jwt/claims"}'
+    depends_on:
+      postgres:
+        condition: service_healthy
+      setup:
+        condition: service_completed_successfully
+    ports:
+      - "8090:8080"
+
+  # Phase 2: apply Hasura table tracking + permissions after Hasura is up
+  hasura-setup:
+    image: node:20-alpine
+    working_dir: /app
+    volumes:
+      - ./scripts:/app
+    environment:
+      HASURA_ENDPOINT: http://hasura:8080
+      HASURA_ADMIN_SECRET: adminsecret
+    command: sh -c "npm install --prefer-offline && node setup-hasura.js"
+    depends_on:
+      hasura:
+        condition: service_started
+
+  frontend:
+    image: nginx:alpine
+    volumes:
+      - ./frontend:/usr/share/nginx/html:ro
+    ports:
+      - "3001:80"
+
+volumes:
+  postgres_data:
+  zitadel_pat:

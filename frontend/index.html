@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>IDP POC</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 860px; margin: 2rem auto; padding: 0 1rem; }
+    pre  { background: #f4f4f4; padding: 1rem; border-radius: 4px; overflow: auto; font-size: .8rem; }
+    button { padding: .5rem 1rem; cursor: pointer; margin: .25rem; }
+    .card { border: 1px solid #ddd; border-radius: 6px; padding: 1rem; margin: 1rem 0; }
+    .error { color: darkred; }
+    .ok    { color: darkgreen; }
+    select { padding: .4rem; }
+    #status { font-weight: bold; }
+  </style>
+</head>
+<body>
+  <h1>IDP POC — Zitadel + Hasura</h1>
+  <div id="app">Loading config…</div>
+
+<script>
+// ---------------------------------------------------------------------------
+// PKCE helpers
+// ---------------------------------------------------------------------------
+function base64url(buf) {
+  return btoa(String.fromCharCode(...new Uint8Array(buf)))
+    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+}
+async function pkceChallenge() {
+  const verifier = base64url(crypto.getRandomValues(new Uint8Array(32)));
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier));
+  return { verifier, challenge: base64url(digest) };
+}
+
+// In-memory token store (never localStorage — tokens are sensitive)
+const tokens = { access: null, refresh: null, claims: null };
+
+// ---------------------------------------------------------------------------
+// Config (written by setup-zitadel.js)
+// ---------------------------------------------------------------------------
+let CFG = {};
+async function loadConfig() {
+  try {
+    const r = await fetch('/config.json');
+    if (!r.ok) throw new Error('config.json not found — has setup finished?');
+    CFG = await r.json();
+  } catch (e) {
+    document.getElementById('app').innerHTML =
+      `<p class="error">${e.message}</p>
+       <p>Run <code>docker compose up</code> and wait for the setup service to complete.</p>`;
+    throw e;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Auth
+// ---------------------------------------------------------------------------
+async function login() {
+  const { verifier, challenge } = await pkceChallenge();
+  sessionStorage.setItem('pkce_verifier', verifier);
+  sessionStorage.setItem('pkce_state', crypto.randomUUID());
+
+  const params = new URLSearchParams({
+    response_type: 'code',
+    client_id: CFG.clientId,
+    redirect_uri: CFG.redirectUri,
+    scope: CFG.scope,
+    code_challenge: challenge,
+    code_challenge_method: 'S256',
+    state: sessionStorage.getItem('pkce_state'),
+  });
+  window.location.href = `${CFG.zitadelDomain}/oauth/v2/authorize?${params}`;
+}
+
+async function exchangeCode(code) {
+  const verifier = sessionStorage.getItem('pkce_verifier');
+  const res = await fetch(`${CFG.zitadelDomain}/oauth/v2/token`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: 'authorization_code',
+      client_id: CFG.clientId,
+      redirect_uri: CFG.redirectUri,
+      code,
+      code_verifier: verifier,
+    }),
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+async function refreshTokens() {
+  if (!tokens.refresh) throw new Error('No refresh token available');
+  const res = await fetch(`${CFG.zitadelDomain}/oauth/v2/token`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: 'refresh_token',
+      client_id: CFG.clientId,
+      refresh_token: tokens.refresh,
+    }),
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+function parseJwt(token) {
+  try {
+    return JSON.parse(atob(token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/')));
+  } catch { return null; }
+}
+
+function storeTokens(data) {
+  tokens.access  = data.access_token;
+  tokens.refresh = data.refresh_token || tokens.refresh;
+  tokens.claims  = parseJwt(data.access_token);
+}
+
+// ---------------------------------------------------------------------------
+// Role switching
+// ---------------------------------------------------------------------------
+async function switchRole(userId, role, branchId) {
+  const res = await fetch(`${CFG.roleValidatorUrl}/switch-role`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ userId, role, branchId }),
+  });
+  if (!res.ok) {
+    const err = await res.json();
+    throw new Error(err.error);
+  }
+  // Re-mint the access token so the new role is reflected immediately
+  const data = await refreshTokens();
+  storeTokens(data);
+}
+
+async function fetchRoles(userId) {
+  const res = await fetch(`${CFG.roleValidatorUrl}/roles/${userId}`);
+  return (await res.json()).roles;
+}
+
+// ---------------------------------------------------------------------------
+// Hasura test query
+// ---------------------------------------------------------------------------
+async function runHasuraQuery() {
+  const query = `
+    query {
+      branches {
+        id
+        name
+      }
+      user_branch_roles(where: { user_id: { _eq: "${tokens.claims?.sub}" } }) {
+        role
+        branch_id
+      }
+    }
+  `;
+  const res = await fetch(CFG.hasuraUrl, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${tokens.access}`,
+    },
+    body: JSON.stringify({ query }),
+  });
+  return res.json();
+}
+
+// ---------------------------------------------------------------------------
+// Render
+// ---------------------------------------------------------------------------
+function renderLoggedOut() {
+  document.getElementById('app').innerHTML = `
+    <div class="card">
+      <p>Not logged in.</p>
+      <button onclick="login()">Login with Zitadel</button>
+    </div>
+  `;
+}
+
+async function renderLoggedIn() {
+  const userId = tokens.claims?.sub;
+  const hasuraClaims = tokens.claims?.['https://hasura.io/jwt/claims'] || {};
+  const currentRole  = hasuraClaims['x-hasura-default-role'] || 'user';
+  const currentBranch = hasuraClaims['x-hasura-branch-id'] || '—';
+
+  let rolesHtml = '<option value="">— select a role —</option>';
+  try {
+    const roles = await fetchRoles(userId);
+    for (const r of roles) {
+      const selected = r.role === hasuraClaims['x-hasura-default-role']?.toUpperCase() &&
+                       r.branchId === hasuraClaims['x-hasura-branch-id'] ? 'selected' : '';
+      rolesHtml += `<option value="${r.role}|${r.branchId}" ${selected}>
+        ${r.role} @ ${r.branchName}
+      </option>`;
+    }
+  } catch (e) {
+    rolesHtml = `<option disabled>Could not load roles: ${e.message}</option>`;
+  }
+
+  document.getElementById('app').innerHTML = `
+    <div class="card">
+      <p id="status">Logged in as <strong>${tokens.claims?.preferred_username || userId}</strong></p>
+      <p>Current role: <strong>${currentRole}</strong> on branch <strong>${currentBranch}</strong></p>
+      <button onclick="logout()">Logout</button>
+    </div>
+
+    <div class="card">
+      <h3>Switch Role</h3>
+      <select id="roleSelect">${rolesHtml}</select>
+      <button onclick="doSwitchRole()">Switch</button>
+      <p id="switchResult"></p>
+    </div>
+
+    <div class="card">
+      <h3>Hasura Test Query</h3>
+      <button onclick="doHasuraQuery()">Run Query</button>
+      <pre id="queryResult">—</pre>
+    </div>
+
+    <div class="card">
+      <h3>Raw Token Claims</h3>
+      <pre>${JSON.stringify(tokens.claims, null, 2)}</pre>
+    </div>
+  `;
+}
+
+async function doSwitchRole() {
+  const sel = document.getElementById('roleSelect').value;
+  const result = document.getElementById('switchResult');
+  if (!sel) return;
+  const [role, branchId] = sel.split('|');
+  try {
+    await switchRole(tokens.claims.sub, role, branchId);
+    result.className = 'ok';
+    result.textContent = `Switched to ${role} on ${branchId} — token refreshed`;
+    await renderLoggedIn(); // re-render with updated claims
+  } catch (e) {
+    result.className = 'error';
+    result.textContent = `Error: ${e.message}`;
+  }
+}
+
+async function doHasuraQuery() {
+  const pre = document.getElementById('queryResult');
+  try {
+    const data = await runHasuraQuery();
+    pre.textContent = JSON.stringify(data, null, 2);
+  } catch (e) {
+    pre.textContent = `Error: ${e.message}`;
+  }
+}
+
+function logout() {
+  tokens.access = tokens.refresh = tokens.claims = null;
+  sessionStorage.clear();
+  renderLoggedOut();
+}
+
+// ---------------------------------------------------------------------------
+// Bootstrap
+// ---------------------------------------------------------------------------
+async function init() {
+  await loadConfig();
+
+  // Handle PKCE callback
+  const params = new URLSearchParams(window.location.search);
+  if (params.has('code')) {
+    const state = params.get('state');
+    if (state !== sessionStorage.getItem('pkce_state')) {
+      document.getElementById('app').innerHTML = '<p class="error">State mismatch — possible CSRF</p>';
+      return;
+    }
+    try {
+      const data = await exchangeCode(params.get('code'));
+      storeTokens(data);
+      // Clean the URL
+      window.history.replaceState({}, '', '/');
+      await renderLoggedIn();
+    } catch (e) {
+      document.getElementById('app').innerHTML = `<p class="error">Token exchange failed: ${e.message}</p>`;
+    }
+    return;
+  }
+
+  tokens.access ? await renderLoggedIn() : renderLoggedOut();
+}
+
+init();
+</script>
+</body>
+</html>

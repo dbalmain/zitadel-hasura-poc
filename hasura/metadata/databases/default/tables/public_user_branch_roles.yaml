@@ -1,0 +1,18 @@
+table:
+  name: user_branch_roles
+  schema: public
+select_permissions:
+  - role: user
+    permission:
+      columns: [user_id, branch_id, role]
+      # Users can only see their own role assignments
+      filter:
+        user_id:
+          _eq: X-Hasura-User-Id
+  - role: branch-coordinator
+    permission:
+      columns: [user_id, branch_id, role]
+      # Branch coordinators can see all roles within their active branch
+      filter:
+        branch_id:
+          _eq: X-Hasura-Branch-Id

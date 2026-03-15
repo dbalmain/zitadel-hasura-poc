@@ -1,0 +1,17 @@
+table:
+  name: users
+  schema: public
+select_permissions:
+  - role: user
+    permission:
+      columns: [id, email]
+      # Each user can only see their own record
+      filter:
+        id:
+          _eq: X-Hasura-User-Id
+  - role: branch-coordinator
+    permission:
+      columns: [id, email]
+      filter:
+        id:
+          _eq: X-Hasura-User-Id
