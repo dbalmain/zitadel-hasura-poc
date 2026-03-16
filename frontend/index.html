@@ -10,7 +10,8 @@
     .card { border: 1px solid #ddd; border-radius: 6px; padding: 1rem; margin: 1rem 0; }
     .error { color: darkred; }
     .ok    { color: darkgreen; }
-    select { padding: .4rem; }
+    select, input { padding: .4rem; margin: .25rem; }
+    input { width: 260px; }
     #status { font-weight: bold; }
   </style>
 </head>
@@ -53,27 +54,43 @@ async function loadConfig() {
 }
 
 // ---------------------------------------------------------------------------
-// Auth
+// Auth — embedded login via Zitadel session API (no redirect to Zitadel UI)
+//
+// Flow:
+//  1. role-validator /api/auth-request proxies the OIDC authorize endpoint
+//     server-side and extracts the authRequestId from the redirect Location.
+//  2. Browser creates a Zitadel session with credentials via /v2/sessions.
+//  3. Browser finalises the auth request via /v2/oidc/auth_requests/{id},
+//     which returns a callbackUrl containing the authorization code.
+//  4. Browser exchanges the code for tokens (PKCE verifier stays in memory).
 // ---------------------------------------------------------------------------
-async function login() {
+async function login(username, password) {
   const { verifier, challenge } = await pkceChallenge();
-  sessionStorage.setItem('pkce_verifier', verifier);
-  sessionStorage.setItem('pkce_state', crypto.randomUUID());
 
-  const params = new URLSearchParams({
-    response_type: 'code',
-    client_id: CFG.clientId,
-    redirect_uri: CFG.redirectUri,
-    scope: CFG.scope,
-    code_challenge: challenge,
-    code_challenge_method: 'S256',
-    state: sessionStorage.getItem('pkce_state'),
+  // All Zitadel API calls are made server-side by the role-validator using the admin PAT.
+  // The PKCE verifier stays in the browser; we only send the challenge.
+  const loginRes = await fetch(`${CFG.roleValidatorUrl}/api/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      username,
+      password,
+      codeChallenge: challenge,
+      clientId: CFG.clientId,
+      redirectUri: CFG.redirectUri,
+      scope: CFG.scope,
+    }),
   });
-  window.location.href = `${CFG.zitadelDomain}/oauth/v2/authorize?${params}`;
+  if (!loginRes.ok) {
+    const err = await loginRes.json();
+    throw new Error(err.error || 'Login failed');
+  }
+  const { code } = await loginRes.json();
+  const data = await exchangeCode(code, verifier);
+  storeTokens(data);
 }
 
-async function exchangeCode(code) {
-  const verifier = sessionStorage.getItem('pkce_verifier');
+async function exchangeCode(code, verifier) {
   const res = await fetch(`${CFG.zitadelDomain}/oauth/v2/token`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -172,10 +189,30 @@ async function runHasuraQuery() {
 function renderLoggedOut() {
   document.getElementById('app').innerHTML = `
     <div class="card">
-      <p>Not logged in.</p>
-      <button onclick="login()">Login with Zitadel</button>
+      <h3>Login</h3>
+      <div>
+        <input id="loginUser" type="text" placeholder="Username" value="alice" /><br>
+        <input id="loginPass" type="password" placeholder="Password" value="Password1!" /><br>
+        <button onclick="doLogin()">Login</button>
+      </div>
+      <p id="loginError" class="error"></p>
     </div>
   `;
+}
+
+async function doLogin() {
+  const username = document.getElementById('loginUser').value;
+  const password = document.getElementById('loginPass').value;
+  const errEl = document.getElementById('loginError');
+  errEl.textContent = 'Logging in…';
+  errEl.className = '';
+  try {
+    await login(username, password);
+    await renderLoggedIn();
+  } catch (e) {
+    errEl.className = 'error';
+    errEl.textContent = `Login failed: ${e.message}`;
+  }
 }
 
 async function renderLoggedIn() {
@@ -253,7 +290,6 @@ async function doHasuraQuery() {
 
 function logout() {
   tokens.access = tokens.refresh = tokens.claims = null;
-  sessionStorage.clear();
   renderLoggedOut();
 }
 
@@ -262,27 +298,6 @@ function logout() {
 // ---------------------------------------------------------------------------
 async function init() {
   await loadConfig();
-
-  // Handle PKCE callback
-  const params = new URLSearchParams(window.location.search);
-  if (params.has('code')) {
-    const state = params.get('state');
-    if (state !== sessionStorage.getItem('pkce_state')) {
-      document.getElementById('app').innerHTML = '<p class="error">State mismatch — possible CSRF</p>';
-      return;
-    }
-    try {
-      const data = await exchangeCode(params.get('code'));
-      storeTokens(data);
-      // Clean the URL
-      window.history.replaceState({}, '', '/');
-      await renderLoggedIn();
-    } catch (e) {
-      document.getElementById('app').innerHTML = `<p class="error">Token exchange failed: ${e.message}</p>`;
-    }
-    return;
-  }
-
   tokens.access ? await renderLoggedIn() : renderLoggedOut();
 }
 

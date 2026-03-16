@@ -111,6 +111,23 @@ async function main() {
   const pat = await readPAT();
   console.log('✓ Admin PAT loaded');
 
+  // 1b. Ensure the admin machine user has IAM_LOGIN_CLIENT role.
+  //     This is required by Zitadel's /v2/oidc/auth_requests endpoint which
+  //     the role-validator uses to finalise embedded logins.
+  const meResp = await zitadelFetch(pat, 'GET', `${ZITADEL}/auth/v1/users/me`);
+  const adminUserId = meResp.user.id;
+  try {
+    await zitadelFetch(pat, 'PUT', `${ZITADEL}/admin/v1/members/${adminUserId}`, {
+      roles: ['IAM_OWNER', 'IAM_LOGIN_CLIENT'],
+    });
+    console.log('✓ Ensured IAM_LOGIN_CLIENT role on setup-admin');
+  } catch (err) {
+    // If already set, ignore
+    if (!err.message.includes('No Changes') && !err.message.includes('COMMAND-Nfh52')) {
+      console.warn('  Warning: could not set IAM_LOGIN_CLIENT:', err.message);
+    }
+  }
+
   // 2. Get the default org ID (needed for user creation)
   const orgResp = await zitadelFetch(pat, 'GET', '/orgs/me');
   const orgId = orgResp.org.id;
@@ -304,7 +321,7 @@ async function main() {
   console.log('  Hasura Console: http://localhost:8090/console  (admin secret: adminsecret)');
   console.log('  role-validator: http://localhost:3000');
   console.log('');
-  console.log('Test credentials: alice@poc.local / Password1!');
+  console.log('Test credentials: alice / Password1!');
   console.log('Admin console:    admin@poc.local / Password1!');
 }
 

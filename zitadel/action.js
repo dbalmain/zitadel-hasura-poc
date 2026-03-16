@@ -10,7 +10,7 @@
  * To update it, re-run setup or patch via the Zitadel Console > Actions.
  */
 function addHasuraClaims(ctx, api) {
-  var userId = ctx.v1.user.id;
+  var userId = ctx.v1.getUser().id;
 
   var response = require("zitadel/http").fetch(
     "http://role-validator:3000/active-role/" + userId,
@@ -25,7 +25,7 @@ function addHasuraClaims(ctx, api) {
   var allowedRoles = ["user"];
   var branchId = "";
 
-  if (response.ok) {
+  if (response.status === 200) {
     var data = JSON.parse(response.body);
     if (data.role) {
       // Convert DB role name (e.g. BRANCH_COORDINATOR) to a Hasura role name

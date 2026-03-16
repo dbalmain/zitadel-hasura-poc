@@ -66,6 +66,8 @@ services:
     environment:
       DATABASE_URL: postgres://postgres:postgres@postgres:5432/app
       PORT: 3000
+    volumes:
+      - zitadel_pat:/pat:ro
     depends_on:
       postgres:
         condition: service_healthy
