@@ -1,12 +1,10 @@
 const express = require('express');
-const http = require('http');
-const fs = require('fs');
 const { Pool } = require('pg');
 
 const app = express();
 app.use(express.json());
 
-// CORS — frontend at :3001 calls this service at :3000
+// CORS — frontend at :3301 calls this service at :3300
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -17,93 +15,28 @@ app.use((req, res, next) => {
 
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 
-// Zitadel is accessed via the nginx proxy which rewrites Host → localhost:8080
-const ZITADEL_PROXY_HOST = process.env.ZITADEL_PROXY_HOST || 'zitadel-proxy';
-const ZITADEL_PROXY_PORT = parseInt(process.env.ZITADEL_PROXY_PORT || '8081', 10);
-const PAT_PATH = process.env.PAT_PATH || '/pat/admin.pat';
+const RAUTHY_URL    = process.env.RAUTHY_URL    || 'http://rauthy:8080';
+const RAUTHY_API_KEY = process.env.RAUTHY_API_KEY;    // "bootstrap$<secret>"
+const RAUTHY_CLIENT_ID = process.env.RAUTHY_CLIENT_ID || 'poc-app';
+const RAUTHY_SCOPE  = 'openid email profile hasura';
 
-// PAT is read lazily — it may not exist until Zitadel finishes first-run init
-let _pat = null;
-function getAdminPat() {
-  if (_pat) return _pat;
-  if (!fs.existsSync(PAT_PATH)) throw new Error('Admin PAT not yet available — is Zitadel still starting up?');
-  _pat = fs.readFileSync(PAT_PATH, 'utf8').trim();
-  return _pat;
-}
-
-// Low-level helper: HTTP request to zitadel-proxy (no redirect following)
-function zitadelRequest(method, path, body, pat) {
-  return new Promise((resolve, reject) => {
-    const data = body ? JSON.stringify(body) : undefined;
-    const req = http.request(
-      {
-        hostname: ZITADEL_PROXY_HOST,
-        port: ZITADEL_PROXY_PORT,
-        path,
-        method,
-        headers: {
-          'Content-Type': 'application/json',
-          ...(pat ? { Authorization: `Bearer ${pat}` } : {}),
-          ...(data ? { 'Content-Length': Buffer.byteLength(data) } : {}),
-        },
-      },
-      (res) => {
-        let raw = '';
-        res.on('data', (chunk) => (raw += chunk));
-        res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: raw }));
-      }
-    );
-    req.on('error', reject);
-    if (data) req.write(data);
-    req.end();
-  });
+// Low-level helper: Rauthy admin API call
+async function rauthyAdmin(method, path, body) {
+  const opts = {
+    method,
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `API-Key ${RAUTHY_API_KEY}`,
+    },
+  };
+  if (body !== undefined) opts.body = JSON.stringify(body);
+  const res = await fetch(`${RAUTHY_URL}${path}`, opts);
+  const text = await res.text();
+  return { status: res.status, body: text ? JSON.parse(text) : null };
 }
 
 // Called by Docker healthcheck
 app.get('/health', (_req, res) => res.json({ status: 'ok' }));
-
-// Called by the Zitadel Action on every token issuance.
-app.get('/active-role/:userId', async (req, res) => {
-  try {
-    const { userId } = req.params;
-    const { rows } = await pool.query(
-      'SELECT role, branch_id FROM user_active_roles WHERE user_id = $1',
-      [userId]
-    );
-    if (rows.length === 0) return res.json({ role: null, branchId: null });
-    res.json({ role: rows[0].role, branchId: rows[0].branch_id });
-  } catch (err) {
-    console.error('active-role error:', err.message);
-    res.status(500).json({ error: 'internal error' });
-  }
-});
-
-// Called by the frontend when the user picks a role.
-app.post('/switch-role', async (req, res) => {
-  try {
-    const { userId, role, branchId } = req.body;
-    if (!userId || !role || !branchId) {
-      return res.status(400).json({ error: 'userId, role, and branchId are required' });
-    }
-    const { rows } = await pool.query(
-      'SELECT 1 FROM user_branch_roles WHERE user_id = $1 AND branch_id = $2 AND role = $3',
-      [userId, branchId, role]
-    );
-    if (rows.length === 0) {
-      return res.status(403).json({ error: 'Role not assigned to this user on this branch' });
-    }
-    await pool.query(
-      `INSERT INTO user_active_roles (user_id, role, branch_id, updated_at)
-       VALUES ($1, $2, $3, NOW())
-       ON CONFLICT (user_id) DO UPDATE SET role = $2, branch_id = $3, updated_at = NOW()`,
-      [userId, role, branchId]
-    );
-    res.json({ success: true, role, branchId });
-  } catch (err) {
-    console.error('switch-role error:', err.message);
-    res.status(500).json({ error: 'internal error' });
-  }
-});
 
 // Called by the frontend to populate the role-switcher UI.
 app.get('/roles/:userId', async (req, res) => {
@@ -124,69 +57,123 @@ app.get('/roles/:userId', async (req, res) => {
   }
 });
 
-// Called by the frontend to perform an embedded login (no redirect to Zitadel UI).
-//
-// Flow (all Zitadel calls made server-side using the admin PAT):
-//  1. Initiate OIDC auth request → extract authRequestId from redirect Location
-//  2. Create a Zitadel session for the user (requires PAT to authorise the API call)
-//  3. Finalise the auth request with the session → get callbackUrl containing the code
-//  4. Return the code to the browser; browser exchanges it with its own PKCE verifier
-//
-// The PKCE verifier never leaves the browser, so the code exchange is still secure.
-app.post('/api/login', async (req, res) => {
-  const { username, password, codeChallenge, clientId, redirectUri, scope } = req.body;
-  if (!username || !password || !codeChallenge || !clientId || !redirectUri) {
-    return res.status(400).json({ error: 'username, password, codeChallenge, clientId, redirectUri are required' });
-  }
-
-  let pat;
+// Called by the frontend when the user picks a role.
+// Validates the assignment in the app DB, updates the user's active role in Rauthy,
+// then immediately refreshes the token and returns the new token pair — one round trip.
+app.post('/switch-role', async (req, res) => {
   try {
-    pat = getAdminPat();
-  } catch (err) {
-    return res.status(503).json({ error: err.message });
-  }
+    const { userId, role, branchId, refresh_token } = req.body;
+    if (!userId || !role || !branchId || !refresh_token) {
+      return res.status(400).json({ error: 'userId, role, branchId, and refresh_token are required' });
+    }
 
-  try {
-    // Step 1 — initiate OIDC auth request; capture authRequestId from the redirect
-    const authParams = new URLSearchParams({
-      response_type: 'code',
-      client_id: clientId,
-      redirect_uri: redirectUri,
-      scope: scope || 'openid profile email offline_access',
-      code_challenge: codeChallenge,
-      code_challenge_method: 'S256',
+    // Validate the role assignment in the app DB
+    const { rows } = await pool.query(
+      'SELECT 1 FROM user_branch_roles WHERE user_id = $1 AND branch_id = $2 AND role = $3',
+      [userId, branchId, role]
+    );
+    if (rows.length === 0) {
+      return res.status(403).json({ error: 'Role not assigned to this user on this branch' });
+    }
+
+    // Convert DB role (SNAKE_CASE) to Hasura role (kebab-case)
+    const hasuraRole = role.toLowerCase().replace(/_/g, '-');
+
+    // Update the user's active role in Rauthy
+    const { status, body: data } = await rauthyAdmin('PUT', `/auth/v1/users/${userId}/attr`, {
+      values: [
+        { key: 'active_role',      value: hasuraRole },
+        { key: 'active_branch_id', value: branchId },
+      ],
     });
-    const authReq = await zitadelRequest('GET', `/oauth/v2/authorize?${authParams}`);
-    const location = authReq.headers['location'];
-    if (!location) throw new Error(`No redirect from Zitadel (status ${authReq.status})`);
-    const locationUrl = location.startsWith('http') ? new URL(location) : new URL(location, 'http://localhost:8080');
-    const authRequestId = locationUrl.searchParams.get('authRequest');
-    if (!authRequestId) throw new Error(`No authRequest in Location: ${location}`);
+    if (status < 200 || status >= 300) {
+      throw new Error(`Rauthy attribute update failed (${status}): ${JSON.stringify(data)}`);
+    }
 
-    // Step 2 — create a Zitadel session for the user (PAT authorises this API call)
-    const sessionResp = await zitadelRequest('POST', '/v2/sessions', {
-      checks: {
-        user: { loginName: username },
-        password: { password },
-      },
-    }, pat);
-    const sessionData = JSON.parse(sessionResp.body);
-    if (sessionResp.status >= 400) throw new Error(sessionData.message || 'Session creation failed');
-    const { sessionId, sessionToken } = sessionData;
+    // Immediately refresh to get a new token reflecting the updated role
+    const tokenRes = await fetch(`${RAUTHY_URL}/auth/v1/oidc/token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        grant_type:    'refresh_token',
+        client_id:     RAUTHY_CLIENT_ID,
+        refresh_token,
+        scope:         RAUTHY_SCOPE,
+      }).toString(),
+    });
+    const tokenData = await tokenRes.json();
+    if (!tokenRes.ok) {
+      throw new Error(`Token refresh failed (${tokenRes.status}): ${JSON.stringify(tokenData)}`);
+    }
 
-    // Step 3 — finalise the auth request with the session
-    const callbackResp = await zitadelRequest('POST', `/v2/oidc/auth_requests/${authRequestId}`, {
-      session: { sessionId, sessionToken },
-    }, pat);
-    const callbackData = JSON.parse(callbackResp.body);
-    if (callbackResp.status >= 400) throw new Error(callbackData.message || 'Auth request finalisation failed');
-    const code = new URL(callbackData.callbackUrl).searchParams.get('code');
-    if (!code) throw new Error('No code in callbackUrl');
+    res.json({
+      access_token:  tokenData.access_token,
+      refresh_token: tokenData.refresh_token || refresh_token,
+    });
+  } catch (err) {
+    console.error('switch-role error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
 
-    res.json({ code });
+// Called by the frontend to perform an embedded login using ROPC.
+// Returns {access_token, refresh_token} directly — no PKCE code exchange needed.
+app.post('/api/login', async (req, res) => {
+  const { username, password } = req.body;
+  if (!username || !password) {
+    return res.status(400).json({ error: 'username and password are required' });
+  }
+  try {
+    const body = new URLSearchParams({
+      grant_type: 'password',
+      client_id:  RAUTHY_CLIENT_ID,
+      username,
+      password,
+      scope: RAUTHY_SCOPE,
+    });
+    const tokenRes = await fetch(`${RAUTHY_URL}/auth/v1/oidc/token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: body.toString(),
+    });
+    const data = await tokenRes.json();
+    if (!tokenRes.ok) {
+      return res.status(401).json({ error: data.error_description || data.error || 'Login failed' });
+    }
+    res.json({ access_token: data.access_token, refresh_token: data.refresh_token });
   } catch (err) {
     console.error('login error:', err.message);
-    res.status(401).json({ error: err.message });
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Called by the frontend after a role switch (or to silently refresh the token).
+// Returns a new {access_token, refresh_token}.
+app.post('/api/refresh', async (req, res) => {
+  const { refresh_token } = req.body;
+  if (!refresh_token) {
+    return res.status(400).json({ error: 'refresh_token is required' });
+  }
+  try {
+    const body = new URLSearchParams({
+      grant_type:    'refresh_token',
+      client_id:     RAUTHY_CLIENT_ID,
+      refresh_token,
+      scope:         RAUTHY_SCOPE,
+    });
+    const tokenRes = await fetch(`${RAUTHY_URL}/auth/v1/oidc/token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: body.toString(),
+    });
+    const data = await tokenRes.json();
+    if (!tokenRes.ok) {
+      return res.status(401).json({ error: data.error_description || data.error || 'Refresh failed' });
+    }
+    res.json({ access_token: data.access_token, refresh_token: data.refresh_token || refresh_token });
+  } catch (err) {
+    console.error('refresh error:', err.message);
+    res.status(500).json({ error: err.message });
   }
 });
 
