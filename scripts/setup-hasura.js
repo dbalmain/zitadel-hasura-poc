@@ -65,20 +65,53 @@ async function main() {
         },
       });
     } catch (err) {
-      if (!err.message.toLowerCase().includes('already exists')) throw err;
+      if (!err.message.includes('already-exists') && !err.message.toLowerCase().includes('already exists') && !err.message.toLowerCase().includes('already defined')) throw err;
     }
   }
 
-  const byUserId   = { id:        { _eq: 'X-Hasura-User-Id'  } };
-  const byBranchId = { branch_id: { _eq: 'X-Hasura-Branch-Id' } };
-  const ownRoles   = { user_id:   { _eq: 'X-Hasura-User-Id'  } };
+  // Drop and recreate a permission — used when the filter/columns need to change.
+  async function resetPermit(table, role, filter, columns) {
+    try {
+      await hasuraQuery({
+        type: 'pg_drop_select_permission',
+        args: { source: 'default', table: { schema: 'public', name: table }, role },
+      });
+    } catch (err) {
+      if (!err.message.toLowerCase().includes('does not exist')) throw err;
+    }
+    await permit(table, role, filter, columns);
+  }
 
-  await permit('branches',          'user',               {},          ['id', 'name']);
-  await permit('branches',          'branch-coordinator', {},          ['id', 'name']);
-  await permit('users',             'user',               byUserId,   ['id', 'email']);
-  await permit('users',             'branch-coordinator', byUserId,   ['id', 'email']);
-  await permit('user_branch_roles', 'user',               ownRoles,   ['user_id', 'branch_id', 'role']);
-  await permit('user_branch_roles', 'branch-coordinator', byBranchId, ['user_id', 'branch_id', 'role']);
+  async function relate(table, name, type, using) {
+    try {
+      await hasuraQuery({
+        type: `pg_create_${type}_relationship`,
+        args: { source: 'default', table: { schema: 'public', name: table }, name, using },
+      });
+    } catch (err) {
+      if (!err.message.includes('already-exists') && !err.message.toLowerCase().includes('already exists')) throw err;
+    }
+  }
+
+  // users.user_branch_roles — lets branch-coordinator permission filter by branch membership
+  await relate('users', 'user_branch_roles', 'array', {
+    foreign_key_constraint_on: { table: { schema: 'public', name: 'user_branch_roles' }, column: 'user_id' },
+  });
+  console.log('✓ Relationships created');
+
+  const byUserId        = { id:        { _eq: 'X-Hasura-User-Id'  } };
+  const byBranchId      = { branch_id: { _eq: 'X-Hasura-Branch-Id' } };
+  const ownRoles        = { user_id:   { _eq: 'X-Hasura-User-Id'  } };
+  // branch-coordinator sees users who have any role in their active branch
+  const usersInBranch   = { user_branch_roles: { branch_id: { _eq: 'X-Hasura-Branch-Id' } } };
+
+  await permit('branches',          'user',               {},             ['id', 'name']);
+  await permit('branches',          'branch-coordinator', {},             ['id', 'name']);
+  await permit('users',             'user',               byUserId,       ['id', 'email']);
+  // Use resetPermit so this is updated if it previously existed with the old self-only filter
+  await resetPermit('users',        'branch-coordinator', usersInBranch,  ['id', 'email']);
+  await permit('user_branch_roles', 'user',               ownRoles,       ['user_id', 'branch_id', 'role']);
+  await permit('user_branch_roles', 'branch-coordinator', byBranchId,     ['user_id', 'branch_id', 'role']);
 
   console.log('✓ Permissions applied');
   console.log('\n=== Hasura setup complete ===');

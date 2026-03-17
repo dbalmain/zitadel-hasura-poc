@@ -65,40 +65,45 @@ async function readPAT() {
 // overwrites it from the URL hostname. We use http.request directly so we can
 // connect to 'zitadel:8080' (Docker DNS) while sending 'Host: localhost:8080'
 // (the EXTERNALDOMAIN Zitadel uses to identify its instance).
-function zitadelFetch(pat, method, urlPath, body) {
+async function zitadelFetch(pat, method, urlPath, body, { retries = 10, retryDelay = 2000 } = {}) {
   const fullUrl = urlPath.startsWith('http') ? new URL(urlPath) : new URL(`${MGMT}${urlPath}`);
   const data = body ? JSON.stringify(body) : undefined;
 
-  return new Promise((resolve, reject) => {
-    const req = http.request(
-      {
-        hostname: fullUrl.hostname,
-        port: fullUrl.port || 8080,
-        path: fullUrl.pathname + fullUrl.search,
-        method,
-        headers: {
-          Host: 'localhost:8080',
-          Authorization: `Bearer ${pat}`,
-          'Content-Type': 'application/json',
-          ...(data ? { 'Content-Length': Buffer.byteLength(data) } : {}),
+  for (let attempt = 0; ; attempt++) {
+    const result = await new Promise((resolve, reject) => {
+      const req = http.request(
+        {
+          hostname: fullUrl.hostname,
+          port: fullUrl.port || 8080,
+          path: fullUrl.pathname + fullUrl.search,
+          method,
+          headers: {
+            Host: 'localhost:8880',
+            Authorization: `Bearer ${pat}`,
+            'Content-Type': 'application/json',
+            ...(data ? { 'Content-Length': Buffer.byteLength(data) } : {}),
+          },
         },
-      },
-      (res) => {
-        let raw = '';
-        res.on('data', (chunk) => (raw += chunk));
-        res.on('end', () => {
-          if (res.statusCode >= 400) {
-            reject(new Error(`${method} ${fullUrl.href} → ${res.statusCode}: ${raw}`));
-          } else {
-            resolve(JSON.parse(raw));
-          }
-        });
-      }
-    );
-    req.on('error', reject);
-    if (data) req.write(data);
-    req.end();
-  });
+        (res) => {
+          let raw = '';
+          res.on('data', (chunk) => (raw += chunk));
+          res.on('end', () => resolve({ status: res.statusCode, raw }));
+        }
+      );
+      req.on('error', reject);
+      if (data) req.write(data);
+      req.end();
+    });
+
+    if (result.status === 503 && attempt < retries) {
+      await wait(retryDelay);
+      continue;
+    }
+    if (result.status >= 400) {
+      throw new Error(`${method} ${fullUrl.href} → ${result.status}: ${result.raw}`);
+    }
+    return JSON.parse(result.raw);
+  }
 }
 
 async function main() {
@@ -213,7 +218,17 @@ async function main() {
       const existing = list.result?.find((a) => a.name === 'addHasuraClaims');
       if (existing) {
         actionId = existing.id;
-        console.log(`✓ Reusing existing Action: addHasuraClaims (${actionId})`);
+        try {
+          await zitadelFetch(pat, 'PUT', `/actions/${actionId}`, {
+            name: 'addHasuraClaims',
+            script: actionScript,
+            timeout: '10s',
+            allowedToFail: false,
+          });
+        } catch (updateErr) {
+          if (!updateErr.message.includes('No changes')) throw updateErr;
+        }
+        console.log(`✓ Updated existing Action: addHasuraClaims (${actionId})`);
       } else {
         throw err;
       }
@@ -274,36 +289,68 @@ async function main() {
     }
   }
 
-  // 8. Seed the app DB with alice's record and role assignments
+  // 8. Create test user bob in Zitadel (branch-1 only, for branch isolation demo)
+  let bobZitadelId;
+  try {
+    const userResp = await zitadelFetch(pat, 'POST', `${ZITADEL}/v2/users/human`, {
+      username: 'bob',
+      organization: { orgId },
+      profile: { givenName: 'Bob', familyName: 'Example' },
+      email: { email: 'bob@poc.local', isVerified: true },
+      password: { password: 'Password1!', changeRequired: false },
+    });
+    bobZitadelId = userResp.userId;
+    console.log(`✓ Created Zitadel user: bob@poc.local (${bobZitadelId})`);
+  } catch (err) {
+    if (err.message.includes('409') || err.message.toLowerCase().includes('alreadyexists') || err.message.includes('already exists') || err.message.includes('UniqueConstraintViolated')) {
+      const search = await zitadelFetch(pat, 'POST', `${ZITADEL}/v2/users`, {
+        queries: [{ userNameQuery: { userName: 'bob', method: 'TEXT_QUERY_METHOD_EQUALS' } }],
+      });
+      bobZitadelId = search.result?.[0]?.userId;
+      if (!bobZitadelId) throw err;
+      console.log(`✓ Reusing existing Zitadel user: bob@poc.local (${bobZitadelId})`);
+    } else {
+      throw err;
+    }
+  }
+
+  // 9. Seed the app DB with alice's and bob's records and role assignments
   const pool = new Pool({ connectionString: process.env.APP_DB_URL });
   try {
     await pool.query(
-      `INSERT INTO users (id, email) VALUES ($1, $2)
-       ON CONFLICT (id) DO NOTHING`,
+      `INSERT INTO users (id, email) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING`,
       [aliceZitadelId, 'alice@poc.local']
     );
+    await pool.query(
+      `INSERT INTO users (id, email) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING`,
+      [bobZitadelId, 'bob@poc.local']
+    );
 
-    const roles = [
+    const aliceRoles = [
       { branchId: 'branch-1', role: 'BRANCH_COORDINATOR' },
       { branchId: 'branch-2', role: 'BRANCH_COORDINATOR' },
       { branchId: 'branch-1', role: 'USER' },
     ];
-    for (const { branchId, role } of roles) {
+    for (const { branchId, role } of aliceRoles) {
       await pool.query(
-        `INSERT INTO user_branch_roles (user_id, branch_id, role)
-         VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
+        `INSERT INTO user_branch_roles (user_id, branch_id, role) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
         [aliceZitadelId, branchId, role]
       );
     }
-    console.log(`✓ Seeded app DB roles for alice`);
+    // Bob is only a USER in branch-1 — he should NOT appear when querying as branch-2 coordinator
+    await pool.query(
+      `INSERT INTO user_branch_roles (user_id, branch_id, role) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
+      [bobZitadelId, 'branch-1', 'USER']
+    );
+    console.log(`✓ Seeded app DB roles for alice and bob`);
   } finally {
     await pool.end();
   }
 
   // 9. Write frontend config
   const config = {
-    zitadelDomain: 'http://localhost:8080',       // reachable from browser
-    roleValidatorUrl: 'http://localhost:3000',     // reachable from browser
+    zitadelDomain: 'http://localhost:8880',       // reachable from browser
+    roleValidatorUrl: 'http://localhost:3300',     // reachable from browser
     hasuraUrl: 'http://localhost:8090/v1/graphql', // reachable from browser
     clientId,
     // Scopes: offline_access gets a refresh token so we can re-mint tokens after role switch
@@ -316,10 +363,10 @@ async function main() {
   console.log('\n=== Setup complete ===');
   console.log('');
   console.log('Services:');
-  console.log('  Frontend:       http://localhost:3001');
-  console.log('  Zitadel:        http://localhost:8080');
+  console.log('  Frontend:       http://localhost:3301');
+  console.log('  Zitadel:        http://localhost:8880');
   console.log('  Hasura Console: http://localhost:8090/console  (admin secret: adminsecret)');
-  console.log('  role-validator: http://localhost:3000');
+  console.log('  role-validator: http://localhost:3300');
   console.log('');
   console.log('Test credentials: alice / Password1!');
   console.log('Admin console:    admin@poc.local / Password1!');

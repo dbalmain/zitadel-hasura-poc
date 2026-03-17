@@ -13,7 +13,7 @@ function addHasuraClaims(ctx, api) {
   var userId = ctx.v1.getUser().id;
 
   var response = require("zitadel/http").fetch(
-    "http://role-validator:3000/active-role/" + userId,
+    "http://role-validator:3300/active-role/" + userId,
     {
       method: "GET",
       headers: { "Content-Type": "application/json" },

@@ -15,7 +15,7 @@ services:
       timeout: 5s
       retries: 10
     ports:
-      - "5432:5432"
+      - "5433:5432"
 
   zitadel:
     image: ghcr.io/zitadel/zitadel:latest
@@ -32,9 +32,9 @@ services:
       ZITADEL_DATABASE_POSTGRES_ADMIN_USERNAME: postgres
       ZITADEL_DATABASE_POSTGRES_ADMIN_PASSWORD: postgres
       ZITADEL_DATABASE_POSTGRES_ADMIN_SSL_MODE: disable
-      # External access — must match what the browser uses (localhost:8080)
+      # External access — must match what the browser uses (localhost:8880)
       ZITADEL_EXTERNALSECURE: "false"
-      ZITADEL_EXTERNALPORT: 8080
+      ZITADEL_EXTERNALPORT: 8880
       ZITADEL_EXTERNALDOMAIN: localhost
       # Machine service account + PAT written to shared volume on first run.
       # Requires the three ORG_MACHINE_* companions to actually create the account.
@@ -57,7 +57,7 @@ services:
     # 'zitadel ready' checks gRPC liveness which doesn't pass in this minimal setup.
     # The setup script polls /debug/healthz over HTTP instead.
     ports:
-      - "8080:8080"
+      - "8880:8080"
     volumes:
       - zitadel_pat:/pat
 
@@ -65,19 +65,19 @@ services:
     build: ./role-validator
     environment:
       DATABASE_URL: postgres://postgres:postgres@postgres:5432/app
-      PORT: 3000
+      PORT: 3300
     volumes:
       - zitadel_pat:/pat:ro
     depends_on:
       postgres:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/health || exit 1"]
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3300/health || exit 1"]
       interval: 5s
       timeout: 5s
       retries: 10
     ports:
-      - "3000:3000"
+      - "3300:3300"
 
   # Phase 1: Zitadel config + DB seed. Must complete before Hasura starts
   # because it registers 'zitadel' as a secondary domain so Hasura's JWK fetch works.
@@ -99,7 +99,7 @@ services:
       role-validator:
         condition: service_healthy
 
-  # Thin nginx proxy that rewrites Host: <anything> → Host: localhost:8080 before
+  # Thin nginx proxy that rewrites Host: <anything> → Host: localhost:8880 before
   # forwarding to Zitadel. Allows Docker services to reach Zitadel without needing
   # to know or send the correct EXTERNALDOMAIN in the Host header.
   zitadel-proxy:
@@ -145,7 +145,7 @@ services:
     volumes:
       - ./frontend:/usr/share/nginx/html:ro
     ports:
-      - "3001:80"
+      - "3301:80"
 
 volumes:
   postgres_data:
