@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <title>IDP POC</title>
+  <title>IDP POC — Phase 3</title>
   <style>
     body { font-family: system-ui, sans-serif; max-width: 860px; margin: 2rem auto; padding: 0 1rem; }
     pre  { background: #f4f4f4; padding: 1rem; border-radius: 4px; overflow: auto; font-size: .8rem; }
@@ -11,182 +11,200 @@
     .error { color: darkred; }
     .ok    { color: darkgreen; }
     select, input { padding: .4rem; margin: .25rem; }
-    input { width: 260px; }
+    input { width: 280px; }
     #status { font-weight: bold; }
+    a { cursor: pointer; color: #0066cc; }
+    .hidden { display: none; }
   </style>
 </head>
 <body>
-  <h1>IDP POC — Rauthy + Hasura</h1>
+  <h1>IDP POC — Kratos + Rust Security Proxy + Hasura</h1>
   <div id="app">Loading config…</div>
 
 <script>
-// In-memory token store (never localStorage — tokens are sensitive)
-const tokens = { access: null, refresh: null, claims: null };
+// ---------------------------------------------------------------------------
+// Config (written by setup-kratos.js — securityProxyUrl only)
+// ---------------------------------------------------------------------------
+let SP = ''; // security proxy base URL
 
-// ---------------------------------------------------------------------------
-// Config (written by setup-rauthy.js)
-// ---------------------------------------------------------------------------
-let CFG = {};
 async function loadConfig() {
-  try {
-    const r = await fetch('/config.json');
-    if (!r.ok) throw new Error('config.json not found — has setup finished?');
-    CFG = await r.json();
-  } catch (e) {
-    document.getElementById('app').innerHTML =
-      `<p class="error">${e.message}</p>
-       <p>Run <code>docker compose up</code> and wait for the setup service to complete.</p>`;
-    throw e;
+  const r = await fetch('/config.json');
+  if (!r.ok) throw new Error('config.json not found — has setup finished?');
+  const cfg = await r.json();
+  SP = cfg.securityProxyUrl;
+}
+
+// ---------------------------------------------------------------------------
+// API helpers — all calls go to the Security Proxy; cookies are sent automatically
+// ---------------------------------------------------------------------------
+async function api(method, path, body) {
+  const opts = {
+    method,
+    credentials: 'include',  // send HttpOnly session cookie cross-origin
+    headers: {},
+  };
+  if (body !== undefined) {
+    opts.headers['Content-Type'] = 'application/json';
+    opts.body = JSON.stringify(body);
   }
-}
-
-// ---------------------------------------------------------------------------
-// Auth — embedded login via ROPC (no redirect to Rauthy UI)
-//
-// Flow:
-//  1. role-validator /api/login proxies credentials to Rauthy ROPC endpoint
-//  2. Returns {access_token, refresh_token} directly — no code exchange needed
-// ---------------------------------------------------------------------------
-async function login(username, password) {
-  const loginRes = await fetch(`${CFG.roleValidatorUrl}/api/login`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ username, password }),
-  });
-  if (!loginRes.ok) {
-    const err = await loginRes.json();
-    throw new Error(err.error || 'Login failed');
-  }
-  const data = await loginRes.json();
-  storeTokens(data);
-}
-
-async function refreshTokens() {
-  if (!tokens.refresh) throw new Error('No refresh token available');
-  const res = await fetch(`${CFG.roleValidatorUrl}/api/refresh`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ refresh_token: tokens.refresh }),
-  });
-  if (!res.ok) throw new Error(await res.text());
-  return res.json();
-}
-
-function parseJwt(token) {
-  try {
-    return JSON.parse(atob(token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/')));
-  } catch { return null; }
-}
-
-function storeTokens(data) {
-  tokens.access  = data.access_token;
-  tokens.refresh = data.refresh_token || tokens.refresh;
-  tokens.claims  = parseJwt(data.access_token);
-}
-
-// ---------------------------------------------------------------------------
-// Role switching — single round trip: validates, updates attribute, returns new token
-// ---------------------------------------------------------------------------
-async function switchRole(userId, role, branchId) {
-  const res = await fetch(`${CFG.roleValidatorUrl}/switch-role`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ userId, role, branchId, refresh_token: tokens.refresh }),
-  });
+  const res = await fetch(`${SP}${path}`, opts);
   if (!res.ok) {
-    const err = await res.json();
-    throw new Error(err.error);
+    const err = await res.json().catch(() => ({ error: res.statusText }));
+    throw new Error(err.error || res.statusText);
   }
-  storeTokens(await res.json());
-}
-
-async function fetchRoles(userId) {
-  const res = await fetch(`${CFG.roleValidatorUrl}/roles/${userId}`);
-  return (await res.json()).roles;
-}
-
-// Convert DB role name (SNAKE_CASE) to Hasura role (kebab-case)
-function toKebab(role) {
-  return role.toLowerCase().replace(/_/g, '-');
-}
-
-// ---------------------------------------------------------------------------
-// Hasura test query
-// ---------------------------------------------------------------------------
-async function runHasuraQuery() {
-  const query = `
-    query {
-      branches {
-        id
-        name
-      }
-      users {
-        id
-        email
-        user_branch_roles {
-          role
-          branch_id
-        }
-      }
-    }
-  `;
-  const res = await fetch(CFG.hasuraUrl, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${tokens.access}`,
-    },
-    body: JSON.stringify({ query }),
-  });
   return res.json();
 }
 
 // ---------------------------------------------------------------------------
-// Render
+// Auth state — fetched from /api/me after login (no tokens stored client-side)
 // ---------------------------------------------------------------------------
-function renderLoggedOut() {
+let currentUser = null; // { user_id, email, active_role, active_branch_id }
+
+// ---------------------------------------------------------------------------
+// Screen: Login (default)
+// ---------------------------------------------------------------------------
+function renderLogin(msg) {
   document.getElementById('app').innerHTML = `
     <div class="card">
       <h3>Login</h3>
       <div>
-        <input id="loginUser" type="text" placeholder="Username" value="alice@poc.local" /><br>
+        <input id="loginEmail" type="email" placeholder="Email" value="alice@poc.local" /><br>
         <input id="loginPass" type="password" placeholder="Password" value="TestPassword1!" /><br>
         <button onclick="doLogin()">Login</button>
       </div>
-      <p id="loginError" class="error"></p>
+      <p id="loginMsg" class="${msg?.isError ? 'error' : 'ok'}">${msg?.text || ''}</p>
+      <p><a onclick="renderForgotPassword()">Forgot password?</a></p>
     </div>
   `;
 }
 
 async function doLogin() {
-  const username = document.getElementById('loginUser').value;
+  const email    = document.getElementById('loginEmail').value;
   const password = document.getElementById('loginPass').value;
-  const errEl = document.getElementById('loginError');
-  errEl.textContent = 'Logging in…';
-  errEl.className = '';
+  const msgEl    = document.getElementById('loginMsg');
+  msgEl.textContent = 'Logging in…';
+  msgEl.className = '';
   try {
-    await login(username, password);
-    await renderLoggedIn();
+    currentUser = await api('POST', '/api/login', { email, password });
+    await renderApp();
   } catch (e) {
-    errEl.className = 'error';
-    errEl.textContent = `Login failed: ${e.message}`;
+    msgEl.className = 'error';
+    msgEl.textContent = `Login failed: ${e.message}`;
   }
 }
 
-async function renderLoggedIn() {
-  const userId = tokens.claims?.sub;
-  // Rauthy embeds custom scope attributes under a "custom" key
-  const currentRole   = tokens.claims?.custom?.active_role      || 'user';
-  const currentBranch = tokens.claims?.custom?.active_branch_id || '—';
+// ---------------------------------------------------------------------------
+// Screen: Forgot Password (3-step flow)
+// ---------------------------------------------------------------------------
+let recoveryToken = null;
+let resetToken = null;
+
+function renderForgotPassword() {
+  document.getElementById('app').innerHTML = `
+    <div class="card">
+      <h3>Forgot Password — Step 1: Enter Email</h3>
+      <p>A 6-digit recovery code will be sent to your email.</p>
+      <input id="fpEmail" type="email" placeholder="Email" /><br>
+      <button onclick="doForgotPassword()">Send Code</button>
+      <p id="fpMsg"></p>
+      <p><a onclick="renderLogin({})">Back to login</a></p>
+    </div>
+  `;
+}
+
+async function doForgotPassword() {
+  const email = document.getElementById('fpEmail').value;
+  const msgEl = document.getElementById('fpMsg');
+  msgEl.className = '';
+  msgEl.textContent = 'Sending…';
+  try {
+    const data = await api('POST', '/api/forgot-password', { email });
+    recoveryToken = data.recovery_token;
+    renderForgotPasswordVerify();
+  } catch (e) {
+    msgEl.className = 'error';
+    msgEl.textContent = `Error: ${e.message}`;
+  }
+}
+
+function renderForgotPasswordVerify() {
+  document.getElementById('app').innerHTML = `
+    <div class="card">
+      <h3>Forgot Password — Step 2: Enter Code</h3>
+      <p>Check <a href="http://localhost:8025" target="_blank">Mailpit (localhost:8025)</a> for your recovery code.</p>
+      <input id="fpCode" type="text" placeholder="6-digit code" maxlength="8" /><br>
+      <button onclick="doVerifyCode()">Verify Code</button>
+      <p id="fpMsg"></p>
+    </div>
+  `;
+}
+
+async function doVerifyCode() {
+  const code  = document.getElementById('fpCode').value.trim();
+  const msgEl = document.getElementById('fpMsg');
+  msgEl.className = '';
+  msgEl.textContent = 'Verifying…';
+  try {
+    const data = await api('POST', '/api/forgot-password/verify', {
+      recovery_token: recoveryToken,
+      code,
+    });
+    resetToken = data.reset_token;
+    renderForgotPasswordReset();
+  } catch (e) {
+    msgEl.className = 'error';
+    msgEl.textContent = `Error: ${e.message}`;
+  }
+}
+
+function renderForgotPasswordReset() {
+  document.getElementById('app').innerHTML = `
+    <div class="card">
+      <h3>Forgot Password — Step 3: Set New Password</h3>
+      <input id="fpNewPass" type="password" placeholder="New password" /><br>
+      <button onclick="doResetPassword()">Set Password</button>
+      <p id="fpMsg"></p>
+    </div>
+  `;
+}
+
+async function doResetPassword() {
+  const newPassword = document.getElementById('fpNewPass').value;
+  const msgEl = document.getElementById('fpMsg');
+  msgEl.className = '';
+  msgEl.textContent = 'Setting password…';
+  try {
+    await api('POST', '/api/forgot-password/reset', {
+      reset_token: resetToken,
+      new_password: newPassword,
+    });
+    recoveryToken = null;
+    resetToken = null;
+    renderLogin({ text: 'Password changed — please log in with your new password.', isError: false });
+  } catch (e) {
+    msgEl.className = 'error';
+    msgEl.textContent = `Error: ${e.message}`;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Screen: Authenticated app
+// ---------------------------------------------------------------------------
+async function renderApp() {
+  // Re-fetch /api/me to get latest session state
+  try {
+    currentUser = await api('GET', '/api/me');
+  } catch {
+    renderLogin({});
+    return;
+  }
 
   let rolesHtml = '<option value="">— select a role —</option>';
   try {
-    const roles = await fetchRoles(userId);
+    const { roles } = await api('GET', '/api/roles');
     for (const r of roles) {
-      const selected = toKebab(r.role) === currentRole && r.branchId === currentBranch ? 'selected' : '';
-      rolesHtml += `<option value="${r.role}|${r.branchId}" ${selected}>
-        ${r.role} @ ${r.branchName}
-      </option>`;
+      const selected = r.role === currentUser.active_role && r.branch_id === currentUser.active_branch_id ? 'selected' : '';
+      rolesHtml += `<option value="${r.role}|${r.branch_id}" ${selected}>${r.role} @ ${r.branch_name}</option>`;
     }
   } catch (e) {
     rolesHtml = `<option disabled>Could not load roles: ${e.message}</option>`;
@@ -194,9 +212,9 @@ async function renderLoggedIn() {
 
   document.getElementById('app').innerHTML = `
     <div class="card">
-      <p id="status">Logged in as <strong>${tokens.claims?.preferred_username || tokens.claims?.email || userId}</strong></p>
-      <p>Current role: <strong>${currentRole}</strong> on branch <strong>${currentBranch}</strong></p>
-      <button onclick="logout()">Logout</button>
+      <p id="status">Logged in as <strong>${currentUser.email}</strong></p>
+      <p>Current role: <strong>${currentUser.active_role}</strong> on branch <strong>${currentUser.active_branch_id}</strong></p>
+      <button onclick="doLogout()">Logout</button>
     </div>
 
     <div class="card">
@@ -207,14 +225,9 @@ async function renderLoggedIn() {
     </div>
 
     <div class="card">
-      <h3>Hasura Test Query</h3>
-      <button onclick="doHasuraQuery()">Run Query</button>
+      <h3>Hasura Test Query (via Security Proxy)</h3>
+      <button onclick="doGraphQL()">Run Query</button>
       <pre id="queryResult">—</pre>
-    </div>
-
-    <div class="card">
-      <h3>Raw Token Claims</h3>
-      <pre>${JSON.stringify(tokens.claims, null, 2)}</pre>
     </div>
   `;
 }
@@ -223,39 +236,66 @@ async function doSwitchRole() {
   const sel = document.getElementById('roleSelect').value;
   const result = document.getElementById('switchResult');
   if (!sel) return;
-  const [role, branchId] = sel.split('|');
+  const [role, branch_id] = sel.split('|');
   try {
-    await switchRole(tokens.claims.sub, role, branchId);
+    const updated = await api('POST', '/api/switch-role', { role, branch_id });
+    currentUser = updated;
     result.className = 'ok';
-    result.textContent = `Switched to ${toKebab(role)} on ${branchId} — token refreshed`;
-    await renderLoggedIn(); // re-render with updated claims
+    result.textContent = `Switched to ${role} on ${branch_id}`;
+    await renderApp();
   } catch (e) {
     result.className = 'error';
     result.textContent = `Error: ${e.message}`;
   }
 }
 
-async function doHasuraQuery() {
+async function doLogout() {
+  try { await api('POST', '/api/logout'); } catch {}
+  currentUser = null;
+  renderLogin({});
+}
+
+async function doGraphQL() {
   const pre = document.getElementById('queryResult');
+  pre.textContent = 'Running…';
   try {
-    const data = await runHasuraQuery();
+    const data = await api('POST', '/graphql', {
+      query: `
+        query {
+          branches { id name }
+          users {
+            id email
+            user_branch_roles { role branch_id }
+          }
+        }
+      `,
+    });
     pre.textContent = JSON.stringify(data, null, 2);
   } catch (e) {
     pre.textContent = `Error: ${e.message}`;
   }
 }
 
-function logout() {
-  tokens.access = tokens.refresh = tokens.claims = null;
-  renderLoggedOut();
-}
-
 // ---------------------------------------------------------------------------
 // Bootstrap
 // ---------------------------------------------------------------------------
 async function init() {
-  await loadConfig();
-  tokens.access ? await renderLoggedIn() : renderLoggedOut();
+  try {
+    await loadConfig();
+  } catch (e) {
+    document.getElementById('app').innerHTML =
+      `<p class="error">${e.message}</p>
+       <p>Run <code>docker compose up</code> and wait for the setup service to print "=== Setup complete ===".</p>`;
+    return;
+  }
+
+  // Try to restore session from existing cookie
+  try {
+    currentUser = await api('GET', '/api/me');
+    await renderApp();
+  } catch {
+    renderLogin({});
+  }
 }
 
 init();

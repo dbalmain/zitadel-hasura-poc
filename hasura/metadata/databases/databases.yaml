@@ -10,5 +10,4 @@
   tables:
     - "!include default/tables/public_branches.yaml"
     - "!include default/tables/public_user_branch_roles.yaml"
-    - "!include default/tables/public_user_active_roles.yaml"
     - "!include default/tables/public_users.yaml"

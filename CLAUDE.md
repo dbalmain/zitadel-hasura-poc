@@ -4,46 +4,56 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Goal
 
-POC investigating **Rauthy** as a self-hosted IdP replacement for AWS Cognito. The key architectural change is that the user's active role is embedded in the JWT at token-issuance time (as a Rauthy custom user attribute), rather than being re-verified on every Hasura request.
+POC investigating **Ory Kratos + Rust Security Proxy** as a replacement for AWS Cognito. Phase 3 of a series:
+- Phase 1: Zitadel (role in JWT, IdP-level)
+- Phase 2: Rauthy (role as user attribute in IdP)
+- **Phase 3 (current):** Kratos for identity, Rust SP for session management — role stored per-session in Postgres, SP mints 30s Hasura JWTs on demand.
+
+**Key architectural shift:** Active role is per-session in Postgres (not in the IdP). Two browser sessions for the same user can hold different roles simultaneously. Role switches update only the session row — zero IdP calls.
 
 ## Architecture
 
 ```
 Browser (HTML/JS)
-  │  ROPC credentials → role-validator → Rauthy /oidc/token
-  │  or refresh_token → role-validator → Rauthy /oidc/token
+  │  Auth API → POST /api/login, /api/logout, /api/switch-role, /api/roles
+  │  Password  → POST /api/forgot-password, /api/forgot-password/verify, /api/forgot-password/reset
+  │  GraphQL   → POST /graphql  (SP proxies to Hasura, injects JWT)
   ▼
-Rauthy (IdP) ─── custom user attributes → JWT flat claims (active_role, active_branch_id)
-  │  RS256 JWT
-  ▼
-Hasura :8090 (GraphQL) — claims_map extracts x-hasura-* from flat claims
-  │  SQL
-  ▼
-PostgreSQL :5432
+Security Proxy (Rust/axum) :3300
+  │  - Session cookie: HttpOnly, SameSite=Strict
+  │  - Validates session against Postgres sessions table
+  │  - Mints 30s RS256 Hasura JWTs on each proxied request
+  │  - Calls Kratos public/admin APIs for auth flows
+  │  - Exposes GET /.well-known/jwks.json (Hasura trusts this)
+  ▼                              ▼
+Kratos :4433/:4434           Hasura :8090
+(public/admin API)           (trusts SP JWKS, not Kratos)
   │
-role-validator :3300  ← updates Rauthy user attributes on role switch
+Mailpit :8025 (web) / :1025 (SMTP)
+  │
+PostgreSQL :5432
+  ├── app  DB: branches, users, user_branch_roles, sessions
+  └── kratos DB: managed entirely by Kratos
 ```
 
-## Key design decisions
-
-- **No action script**: Active role lives as a Rauthy custom user attribute (`active_role`, `active_branch_id`). Updated via Rauthy admin API (`PUT /auth/v1/users/{id}/attr`) on role switch. No external HTTP call per token issuance.
-- **ROPC login**: role-validator proxies credentials to `POST /oidc/token` with `grant_type=password`. Returns tokens directly — no PKCE code exchange needed.
-- **Custom scope `hasura`**: Rauthy scope configured to embed `active_role`, `active_branch_id`, `allowed_roles` attributes into access tokens (`attr_include_access`).
-- **Flat JWT claims**: Rauthy emits claims directly at the top level (no `https://hasura.io/jwt/claims` namespace). Hasura uses `claims_map` with JSONPath to extract headers.
-- **RS256 signing**: Configured per client (`access_token_alg: RS256`) so Hasura can verify via JWKS at `/oidc/certs`.
-- **Access token TTL: 5 minutes**. Bounds how long a switched role stays active.
-- **Role switching flow**: frontend calls `POST /switch-role` → role-validator updates Rauthy user attributes → frontend calls `POST /api/refresh` → new access token with updated claims.
-- **App DB only**: PostgreSQL only stores the `app` database. Rauthy uses SQLite (in `rauthy_data` Docker volume).
+**Key design decisions:**
+- The SP is the sole JWT issuer for Hasura. Hasura has no knowledge of Kratos.
+- Role switching only updates the session row — zero IdP calls, zero global side effects.
+- Two browser sessions for the same user can hold different roles simultaneously.
+- Password recovery uses Kratos's native code flow (6-digit code in email, entered in our UI).
+- In-memory map in the SP tracks recovery flow state (TTL = 15 min).
+- RSA key pair generated on SP startup; short JWT TTL (30s) minimises the impact if the SP restarts.
 
 ## Services
 
 | Service | Port | Purpose |
 |---------|------|---------|
-| `postgres` | 5433 | App DB (branches, users, user_branch_roles) |
-| `rauthy` | 8880 | IdP — OIDC/OAuth2, token issuance, custom attributes |
-| `role-validator` | 3300 | Validates role switches, updates Rauthy attributes, proxies login/refresh |
-| `setup` | — | One-shot Node.js script; configures Rauthy + seeds DB |
-| `hasura` | 8090 | GraphQL API; trusts role from JWT claim |
+| `postgres` | 5433 | App DB (branches, users, user_branch_roles, sessions) + kratos DB |
+| `kratos` | 4433/4434 | IdP — identity storage, authentication, recovery codes |
+| `mailpit` | 8025/1025 | Dev mail server — catch recovery emails |
+| `security-proxy` | 3300 | Rust/axum: session management, JWT minting, GraphQL proxy |
+| `setup` | — | One-shot Node.js: creates Kratos identities + seeds app DB |
+| `hasura` | 8090 | GraphQL API; trusts SP's JWKS |
 | `hasura-setup` | — | One-shot: applies Hasura table tracking + permissions |
 | `frontend` | 3301 | Static nginx serving `frontend/index.html` |
 
@@ -51,77 +61,155 @@ role-validator :3300  ← updates Rauthy user attributes on role switch
 
 ```bash
 docker compose up
-# Wait for the 'setup' service to print "=== Setup complete ===" (~60-90s on first run)
+# Wait for setup to print "=== Setup complete ===" (~90s on first run due to Rust build cache miss)
+# Subsequent code-only rebuilds: ~30s
 # Then open http://localhost:3301
 ```
 
-Test credentials: `alice@poc.local / Password1!` and `bob@poc.local / Password1!`
-Rauthy admin UI: `http://localhost:8880` → `admin@localhost / 123SuperSafe` (DEV_MODE)
-Hasura console: `http://localhost:8090/console` → admin secret: `adminsecret`
+Test credentials (all passwords: `TestPassword1!`):
+- `alice@poc.local` — branch-1 & branch-2 (coordinator + user on both)
+- `charlie@poc.local` — branch-1 user
+- `diana@poc.local` — branch-1 user
+- `eve@poc.local` — branch-2 user
+- `frank@poc.local` — branch-2 (coordinator + user)
 
-To force a clean re-setup:
+Kratos admin UI: accessible via API only (no built-in UI)
+Hasura console: `http://localhost:8090/console` → admin secret: `adminsecret`
+Mailpit web UI: `http://localhost:8025` (recovery code emails appear here)
+
+To force clean re-setup:
 ```bash
-docker compose down -v   # removes volumes including Rauthy SQLite DB
+docker compose down -v
 docker compose up
 ```
 
-To iterate on just the role-validator:
+To iterate on just the security-proxy:
 ```bash
-docker compose up --build role-validator
+docker compose up --build security-proxy
 ```
 
-## Codebase structure
+## Codebase Structure
 
 ```
-docker-compose.yml          Orchestrates all services
+docker-compose.yml              Orchestrates all services
 postgres/
-  init.sql                  Creates 'app' DB + schema (branches, users, roles, user_active_roles)
-role-validator/
-  src/index.js              Express app — /api/login, /api/refresh, /switch-role, /roles
-  Dockerfile
+  init.sql                      Creates app + kratos DBs; app schema (branches, users, sessions)
+kratos/
+  kratos.yml                    Kratos config (DB, SMTP, code recovery, native flows)
+  identity.schema.json          Identity schema (email only)
+security-proxy/
+  Cargo.toml                    Rust dependencies
+  Dockerfile                    Cargo Chef multi-stage (fast rebuilds)
+  src/
+    main.rs                     Entry point — AppState, router, bind
+    config.rs                   Config::from_env()
+    error.rs                    AppError → axum Response
+    state.rs                    AppState { db, kratos, jwt_keys, recovery_store, ... }
+    db.rs                       Session CRUD, get_user_roles, has_role
+    jwt.rs                      JwtKeys::generate(), mint_hasura_jwt(), jwks_document()
+    kratos.rs                   Typed wrappers: login, revoke_session, recovery, settings flows
+    session.rs                  Session struct, SESSION_COOKIE_NAME
+    recovery.rs                 RecoveryStore (DashMap) — maps opaque tokens to Kratos state
+    routes/
+      mod.rs                    Router assembly + CORS + CookieManager layers
+      health.rs                 GET /health
+      jwks.rs                   GET /.well-known/jwks.json
+      auth.rs                   /api/login, /api/logout, /api/me, /api/roles,
+                                /api/switch-role, /api/forgot-password,
+                                /api/forgot-password/verify, /api/forgot-password/reset
+      graphql.rs                POST /graphql — proxy + JWT injection
 scripts/
-  setup-rauthy.js           One-shot setup: Rauthy config + DB seed + config.json
-  setup-hasura.js           Phase 2: applies Hasura table tracking + permissions
-  package.json
+  setup-kratos.js               Creates Kratos identities + seeds app DB + writes config.json
+  setup-hasura.js               Phase 2: applies Hasura table tracking + permissions
+  package.json                  Just needs pg
 frontend/
-  index.html                Single-page ROPC demo
-  config.json               Written by setup script; NOT in git (gitignored)
-zitadel/
-  action.js                 (Legacy — not used with Rauthy)
+  index.html                    SPA — cookie-based auth, role switching, forgot-password flow
+  config.json                   Written by setup; gitignored. Contains { securityProxyUrl }
+hasura/
+  metadata/                     Hasura metadata YAML (reference only; state managed via API)
 ```
 
-## Rauthy admin API
+## SP API Endpoints
 
-- Base URL: `http://rauthy:8080/auth/v1` (internal Docker network)
-- Auth header: `Authorization: API-Key bootstrap$<secret>`
-- Create user: `POST /auth/v1/users`
-- Set password: `PUT /auth/v1/users/{id}` (include `"password"` field)
-- Set attributes: `PUT /auth/v1/users/{id}/attr` → `{"values": [{"key": "...", "value": ...}]}`
-- Create attribute definition: `POST /auth/v1/users/attr`
-- Create scope: `POST /auth/v1/scopes` → `{"scope": "hasura", "attr_include_access": [...]}`
-- Create client: `POST /auth/v1/clients`
+| Method | Path | Auth | Purpose |
+|--------|------|------|---------|
+| POST | /api/login | — | `{email, password}` → create session, set cookie |
+| POST | /api/logout | cookie | Delete session, clear cookie |
+| GET | /api/me | cookie | `{user_id, email, active_role, active_branch_id}` |
+| GET | /api/roles | cookie | `{roles: [{role, branch_id, branch_name}]}` |
+| POST | /api/switch-role | cookie | `{role, branch_id}` → update session row only |
+| POST | /api/forgot-password | — | `{email}` → always 200; returns `{recovery_token}` |
+| POST | /api/forgot-password/verify | — | `{recovery_token, code}` → `{reset_token}` |
+| POST | /api/forgot-password/reset | — | `{reset_token, new_password}` → set via Kratos settings |
+| POST | /graphql | cookie | Proxy to Hasura with minted JWT |
+| GET | /.well-known/jwks.json | — | SP's RSA public key |
+| GET | /health | — | `{"status":"ok"}` |
 
-## Hasura JWT config
+## Hasura JWT Config
 
+The SP mints JWTs with the standard `https://hasura.io/jwt/claims` namespace — no `claims_map` needed:
+
+```yaml
+HASURA_GRAPHQL_JWT_SECRET: >
+  {"type":"RS256","jwk_url":"http://security-proxy:3300/.well-known/jwks.json"}
+```
+
+JWT payload from SP (30-second TTL):
 ```json
 {
-  "type": "RS256",
-  "jwk_url": "http://rauthy:8080/oidc/certs",
-  "claims_map": {
-    "x-hasura-default-role":  {"path": "$.active_role"},
-    "x-hasura-allowed-roles": {"path": "$.allowed_roles"},
-    "x-hasura-user-id":       {"path": "$.sub"},
-    "x-hasura-branch-id":     {"path": "$.active_branch_id"}
+  "sub": "user-uuid",
+  "exp": 1234567890,
+  "iat": 1234567860,
+  "iss": "security-proxy",
+  "https://hasura.io/jwt/claims": {
+    "x-hasura-default-role": "branch-coordinator",
+    "x-hasura-allowed-roles": ["branch-coordinator"],
+    "x-hasura-user-id": "user-uuid",
+    "x-hasura-branch-id": "branch-1"
   }
 }
 ```
 
-Permissions check `x-hasura-branch-id` from the token rather than re-querying `user_branch_roles` on every request.
+## Sessions Table (app DB)
 
-## Known rough edges / investigation points
+```sql
+CREATE TABLE sessions (
+  id                TEXT PRIMARY KEY,  -- UUID in HttpOnly cookie
+  user_id           TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  active_role       TEXT NOT NULL,     -- kebab-case: "branch-coordinator", "user"
+  active_branch_id  TEXT NOT NULL,
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  last_seen_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  expires_at        TIMESTAMPTZ NOT NULL,  -- 8 hours from creation
+  kratos_session_id TEXT                   -- for logout propagation
+);
+```
 
-- `allowed_roles` attribute is stored as a JSON array in Rauthy — verify it appears as an array (not string) in the JWT
-- ROPC with `grant_type=password` must be confirmed to return `refresh_token` (client needs `refresh_token` in `flows_enabled`)
-- Rauthy's `DEV_MODE=true` sets admin password to `123SuperSafe` regardless of `BOOTSTRAP_ADMIN_PASSWORD_PLAIN`
-- The `user_active_roles` table in PostgreSQL is unused (kept from Zitadel POC) — can be dropped
-- `frontend/config.json` is regenerated on every setup run and should be gitignored
+Role names are stored in kebab-case (matching Hasura permission role names). No conversion needed in the SP.
+
+## Kratos Flow Details (SP ↔ Kratos, server-to-server)
+
+**Login (native API flow):**
+```
+GET  /self-service/login/api           → { ui: { action } }
+POST <action>  { method:"password", identifier, password }
+               → { session: { id, identity: { id } }, session_token }
+```
+
+**Forgot password (native code recovery):**
+```
+GET  /self-service/recovery/api        → { ui: { action } }
+POST <action>  { method:"code", email }  → state:"sent_email", updated action
+  [SP stores: recovery_token → action_url]
+POST <action>  { method:"code", code }   → { session_token }
+  [SP stores: reset_token → session_token]
+GET  /self-service/settings/api        X-Session-Token: <token>  → { ui: { action } }
+POST <action>  { method:"password", password }  → state:"success"
+```
+
+## Known Rough Edges
+
+- RSA key generated on SP startup — if SP restarts, existing Hasura JWT verifications fail until JWKS re-cached (max ~60s based on `Cache-Control: max-age=60` on JWKS endpoint)
+- `user_active_roles` table dropped; `sessions` replaces it
+- Kratos `--watch-courier` flag required for email delivery in dev mode
+- `frontend/config.json` is regenerated on every setup run and is gitignored

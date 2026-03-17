@@ -1,7 +1,7 @@
 {
   "name": "idp-poc-setup",
   "version": "1.0.0",
-  "main": "setup-zitadel.js",
+  "main": "setup-kratos.js",
   "dependencies": {
     "pg": "^8.11.3"
   }

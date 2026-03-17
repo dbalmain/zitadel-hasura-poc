@@ -1,5 +1,3 @@
-version: "3.8"
-
 services:
   postgres:
     image: postgres:16-alpine
@@ -17,45 +15,68 @@ services:
     ports:
       - "5433:5432"
 
-  rauthy:
-    image: ghcr.io/sebadob/rauthy:0.34.3
-    environment:
-      # HTTP mode — no TLS (DEV_MODE intentionally omitted; it suppresses BOOTSTRAP_API_KEY)
-      - PUB_URL=localhost:8880
-      - LISTEN_SCHEME=http
-      - HTTP_DANGER_UNENCRYPTED=true
-      - COOKIE_MODE=danger-insecure
-      # Admin credentials
-      - BOOTSTRAP_ADMIN_PASSWORD_PLAIN=Password1!
-      # Bootstrap API key for programmatic setup
-      # JSON: {"name":"bootstrap","exp":1893456000,"access":[Clients,Users,Roles]}
-      - BOOTSTRAP_API_KEY=eyJuYW1lIjoiYm9vdHN0cmFwIiwiZXhwIjoxODkzNDU2MDAwLCJhY2Nlc3MiOlt7Imdyb3VwIjoiQ2xpZW50cyIsImFjY2Vzc19yaWdodHMiOlsicmVhZCIsImNyZWF0ZSIsInVwZGF0ZSIsImRlbGV0ZSJdfSx7Imdyb3VwIjoiVXNlcnMiLCJhY2Nlc3NfcmlnaHRzIjpbInJlYWQiLCJjcmVhdGUiLCJ1cGRhdGUiLCJkZWxldGUiXX0seyJncm91cCI6IlJvbGVzIiwiYWNjZXNzX3JpZ2h0cyI6WyJyZWFkIiwiY3JlYXRlIiwidXBkYXRlIiwiZGVsZXRlIl19LHsiZ3JvdXAiOiJVc2VyQXR0cmlidXRlcyIsImFjY2Vzc19yaWdodHMiOlsicmVhZCIsImNyZWF0ZSIsInVwZGF0ZSIsImRlbGV0ZSJdfSx7Imdyb3VwIjoiU2NvcGVzIiwiYWNjZXNzX3JpZ2h0cyI6WyJyZWFkIiwiY3JlYXRlIiwidXBkYXRlIiwiZGVsZXRlIl19LHsiZ3JvdXAiOiJHcm91cHMiLCJhY2Nlc3NfcmlnaHRzIjpbInJlYWQiLCJjcmVhdGUiLCJ1cGRhdGUiLCJkZWxldGUiXX1dfQ==
-      - BOOTSTRAP_API_KEY_SECRET=BootstrapAPIKeySecretForRauthyPOCDevelopmentOnly1234567890ABCDEFg
-      - DISABLE_REFRESH_TOKEN_NBF=true
-      # Encryption key for secrets stored in DB (required)
-      - ENC_KEYS=bVCyTsGaggVy5yqQ/UzluN29DZW41M3hTSkx6Y3NtZmRuQkR2TnJxUTYzcjQ=
-      - ENC_KEY_ACTIVE=bVCyTsGaggVy5yqQ
+  mailpit:
+    image: axllent/mailpit
     ports:
-      - "8880:8080"
-    volumes:
-      - rauthy_data:/app/data
-      - ./rauthy/config.toml:/app/config.toml:ro
-    # No healthcheck — the setup script polls /health itself via waitForRauthy()
+      - "8025:8025"  # Web UI — check recovery emails here
+      - "1025:1025"  # SMTP
 
-  role-validator:
-    build: ./role-validator
-    environment:
-      DATABASE_URL: postgres://postgres:postgres@postgres:5432/app
-      PORT: 3300
-      RAUTHY_URL: http://rauthy:8080
-      # API key header value: "API-Key <name>$<secret>"
-      RAUTHY_API_KEY: "bootstrap$$BootstrapAPIKeySecretForRauthyPOCDevelopmentOnly1234567890ABCDEFg"
-      RAUTHY_CLIENT_ID: poc-app
+  kratos:
+    image: oryd/kratos:v1.1.0
     depends_on:
       postgres:
         condition: service_healthy
-      rauthy:
-        condition: service_started
+    volumes:
+      - ./kratos:/etc/kratos:ro
+    environment:
+      DSN: postgres://postgres:postgres@postgres:5432/kratos?sslmode=disable
+      LOG_LEVEL: info
+    entrypoint: ["/bin/sh", "-c"]
+    command: >
+      "kratos migrate sql -e --yes --config /etc/kratos/kratos.yml &&
+       exec kratos serve --config /etc/kratos/kratos.yml --dev --watch-courier"
+    ports:
+      - "4433:4433"  # Public API
+      - "4434:4434"  # Admin API
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:4433/health/ready || exit 1"]
+      interval: 5s
+      timeout: 10s
+      retries: 60
+
+  # Phase 1: create Kratos identities + seed app DB
+  setup:
+    image: node:20-alpine
+    working_dir: /app
+    volumes:
+      - ./scripts:/app
+      - ./frontend:/frontend
+    environment:
+      KRATOS_ADMIN_URL: http://kratos:4434
+      APP_DB_URL: postgres://postgres:postgres@postgres:5432/app
+    command: sh -c "npm install --prefer-offline && node setup-kratos.js"
+    depends_on:
+      kratos:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+
+  security-proxy:
+    build: ./security-proxy
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/app
+      KRATOS_PUBLIC_URL: http://kratos:4433
+      KRATOS_ADMIN_URL: http://kratos:4434
+      HASURA_URL: http://hasura:8080/v1/graphql
+      PORT: "3300"
+      RUST_LOG: info
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kratos:
+        condition: service_healthy
+      setup:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://localhost:3300/health || exit 1"]
       interval: 5s
@@ -64,24 +85,6 @@ services:
     ports:
       - "3300:3300"
 
-  # Phase 1: Rauthy config + DB seed. Must complete before Hasura starts.
-  setup:
-    image: node:20-alpine
-    working_dir: /app
-    volumes:
-      - ./scripts:/app
-      - ./frontend:/frontend
-    environment:
-      RAUTHY_URL: http://rauthy:8080
-      RAUTHY_API_KEY: "bootstrap$$BootstrapAPIKeySecretForRauthyPOCDevelopmentOnly1234567890ABCDEFg"
-      APP_DB_URL: postgres://postgres:postgres@postgres:5432/app
-    command: sh -c "npm install --prefer-offline && node setup-rauthy.js"
-    depends_on:
-      rauthy:
-        condition: service_started
-      postgres:
-        condition: service_healthy
-
   hasura:
     image: hasura/graphql-engine:v2.38.0
     environment:
@@ -89,13 +92,16 @@ services:
       HASURA_GRAPHQL_ENABLE_CONSOLE: "true"
       HASURA_GRAPHQL_ADMIN_SECRET: adminsecret
       HASURA_GRAPHQL_UNAUTHORIZED_ROLE: anonymous
-      # Rauthy emits flat JWT claims; use claims_map to extract Hasura headers.
-      HASURA_GRAPHQL_JWT_SECRET: '{"type":"RS256","jwk_url":"http://rauthy:8080/auth/v1/oidc/certs","claims_map":{"x-hasura-default-role":{"path":"$.custom.active_role"},"x-hasura-allowed-roles":{"path":"$.custom.allowed_roles"},"x-hasura-user-id":{"path":"$.sub"},"x-hasura-branch-id":{"path":"$.custom.active_branch_id"}}}'
+      # Security proxy mints JWTs with standard https://hasura.io/jwt/claims namespace
+      HASURA_GRAPHQL_JWT_SECRET: >
+        {"type":"RS256","jwk_url":"http://security-proxy:3300/.well-known/jwks.json"}
     depends_on:
       postgres:
         condition: service_healthy
       setup:
         condition: service_completed_successfully
+      security-proxy:
+        condition: service_healthy
     ports:
       - "8090:8080"
 
@@ -122,4 +128,3 @@ services:
 
 volumes:
   postgres_data:
-  rauthy_data:

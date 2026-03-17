@@ -1,5 +1,0 @@
-table:
-  name: user_active_roles
-  schema: public
-# This table is written exclusively by role-validator and read by the Zitadel Action.
-# No direct access is granted to end users via Hasura.

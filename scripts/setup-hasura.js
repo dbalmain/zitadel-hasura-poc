@@ -40,7 +40,8 @@ async function main() {
   console.log('=== Hasura Metadata Setup ===\n');
   await waitForHasura();
 
-  const tables = ['branches', 'users', 'user_branch_roles', 'user_active_roles'];
+  // Track tables (user_active_roles removed — sessions are managed by the security proxy)
+  const tables = ['branches', 'users', 'user_branch_roles'];
   for (const table of tables) {
     try {
       await hasuraQuery({
@@ -108,7 +109,6 @@ async function main() {
   await permit('branches',          'user',               {},             ['id', 'name']);
   await permit('branches',          'branch-coordinator', {},             ['id', 'name']);
   await permit('users',             'user',               byUserId,       ['id', 'email']);
-  // Use resetPermit so this is updated if it previously existed with the old self-only filter
   await resetPermit('users',        'branch-coordinator', usersInBranch,  ['id', 'email']);
   await permit('user_branch_roles', 'user',               ownRoles,       ['user_id', 'branch_id', 'role']);
   await permit('user_branch_roles', 'branch-coordinator', byBranchId,     ['user_id', 'branch_id', 'role']);
