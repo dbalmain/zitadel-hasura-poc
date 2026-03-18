@@ -1,14 +1,17 @@
 use anyhow::{anyhow, Result};
+use async_trait::async_trait;
 use reqwest::Client;
 use serde_json::{json, Value};
 
-pub struct KratosClient {
+use crate::idp::{AuthFlow, IdentityProvider};
+
+pub struct KratosProvider {
     client: Client,
     public_url: String,
     admin_url: String,
 }
 
-impl KratosClient {
+impl KratosProvider {
     pub fn new(public_url: &str, admin_url: &str) -> Self {
         Self {
             client: Client::new(),
@@ -16,9 +19,23 @@ impl KratosClient {
             admin_url: admin_url.to_string(),
         }
     }
+}
 
-    /// Perform Kratos native login. Returns (kratos_identity_id, kratos_session_id).
-    pub async fn login(&self, email: &str, password: &str) -> Result<(String, String)> {
+#[async_trait]
+impl IdentityProvider for KratosProvider {
+    fn auth_flow(&self) -> AuthFlow {
+        AuthFlow::Credentials
+    }
+
+    fn authorize_url(&self, _state: &str, _code_challenge: &str, _redirect_uri: &str) -> String {
+        unimplemented!("Kratos does not support OIDC redirect flow")
+    }
+
+    async fn exchange_code(&self, _code: &str, _code_verifier: &str, _redirect_uri: &str) -> Result<(String, String)> {
+        Err(anyhow!("Kratos does not support OIDC redirect flow"))
+    }
+
+    async fn authenticate(&self, email: &str, password: &str) -> Result<(String, String)> {
         // Step 1: Create login flow
         let flow: Value = self
             .client
@@ -67,8 +84,7 @@ impl KratosClient {
         Ok((identity_id, session_id))
     }
 
-    /// Revoke a Kratos session via admin API.
-    pub async fn revoke_session(&self, session_id: &str) -> Result<()> {
+    async fn revoke_session(&self, session_id: &str) -> Result<()> {
         let resp = self
             .client
             .delete(format!("{}/admin/sessions/{}", self.admin_url, session_id))
@@ -82,8 +98,8 @@ impl KratosClient {
         }
     }
 
-    /// Initiate password recovery (code flow). Returns action_url for subsequent steps.
-    pub async fn start_recovery(&self) -> Result<String> {
+    async fn begin_recovery(&self, email: &str) -> Result<String> {
+        // Step 1: Initiate recovery flow
         let flow: Value = self
             .client
             .get(format!("{}/self-service/recovery/api", self.public_url))
@@ -97,14 +113,10 @@ impl KratosClient {
             .ok_or_else(|| anyhow!("no action url in recovery flow"))?
             .to_string();
 
-        Ok(action_url)
-    }
-
-    /// Submit email to recovery flow. Returns updated action_url.
-    pub async fn submit_recovery_email(&self, action_url: &str, email: &str) -> Result<String> {
+        // Step 2: Submit email
         let resp = self
             .client
-            .post(action_url)
+            .post(&action_url)
             .json(&json!({
                 "method": "code",
                 "email": email,
@@ -116,22 +128,20 @@ impl KratosClient {
         // Kratos returns the updated flow; use its action URL for the next step
         let updated_action = body["ui"]["action"]
             .as_str()
-            .unwrap_or(action_url)
+            .unwrap_or(&action_url)
             .to_string();
 
         Ok(updated_action)
     }
 
-    /// Submit recovery code. Returns Ok(()) on success.
+    /// Verify a recovery code. flow_state is the action URL returned by begin_recovery.
     ///
     /// Kratos v1.x returns HTTP 422 "browser_location_change_required" on
-    /// successful code verification, with no session token available.
-    /// We simply confirm success and let the caller use the admin API to
-    /// set a new password.
-    pub async fn submit_recovery_code(&self, action_url: &str, code: &str) -> Result<()> {
+    /// successful code verification. We treat that as success.
+    async fn verify_recovery_code(&self, flow_state: &str, code: &str) -> Result<()> {
         let resp = self
             .client
-            .post(action_url)
+            .post(flow_state)
             .json(&json!({
                 "method": "code",
                 "code": code,
@@ -143,7 +153,7 @@ impl KratosClient {
         let body: Value = resp.json().await.unwrap_or_default();
 
         tracing::debug!(
-            "submit_recovery_code: status={} body={}",
+            "verify_recovery_code: status={} body={}",
             status,
             body
         );
@@ -160,7 +170,6 @@ impl KratosClient {
             return Ok(());
         }
 
-        // Error — extract human-readable message from the flow UI
         let msg = body["ui"]["messages"][0]["text"]
             .as_str()
             .unwrap_or("Invalid or expired recovery code")
@@ -168,10 +177,7 @@ impl KratosClient {
         Err(anyhow!("{}", msg))
     }
 
-    /// Directly set a user's password via the Kratos admin API.
-    /// `identity_id` is the Kratos UUID (= app users.id).
-    /// `email` is the user's email address (needed to preserve traits).
-    pub async fn admin_set_password(
+    async fn set_password(
         &self,
         identity_id: &str,
         email: &str,
@@ -197,7 +203,7 @@ impl KratosClient {
         } else {
             let status = resp.status();
             let body: Value = resp.json().await.unwrap_or_default();
-            tracing::debug!("admin_set_password error: status={} body={}", status, body);
+            tracing::debug!("set_password error: status={} body={}", status, body);
             let msg = body["error"]["message"]
                 .as_str()
                 .unwrap_or("Failed to set password")

@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone)]
 pub struct RecoveryEntry {
-    pub action_url: String,
+    pub flow_state: String,
     pub email: String,
     pub created_at: Instant,
 }
@@ -32,11 +32,11 @@ impl RecoveryStore {
         }
     }
 
-    pub fn store_recovery(&self, token: String, action_url: String, email: String) {
+    pub fn store_recovery(&self, token: String, flow_state: String, email: String) {
         self.recovery.insert(
             token,
             RecoveryEntry {
-                action_url,
+                flow_state,
                 email,
                 created_at: Instant::now(),
             },

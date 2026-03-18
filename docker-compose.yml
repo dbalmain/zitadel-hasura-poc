@@ -44,7 +44,59 @@ services:
       timeout: 10s
       retries: 60
 
-  # Phase 1: create Kratos identities + seed app DB
+  # Fix /pat volume permissions so the non-root zitadel user can write the PAT file
+  zitadel-permissions:
+    image: alpine
+    volumes:
+      - pat:/pat
+    command: ["chmod", "777", "/pat"]
+
+  zitadel:
+    image: ghcr.io/zitadel/zitadel:latest
+    command: start-from-init --masterkey "MasterkeyNeedsToHave32Characters" --tlsMode disabled
+    depends_on:
+      postgres:
+        condition: service_healthy
+      zitadel-permissions:
+        condition: service_completed_successfully
+    environment:
+      ZITADEL_DATABASE_POSTGRES_HOST: postgres
+      ZITADEL_DATABASE_POSTGRES_PORT: "5432"
+      ZITADEL_DATABASE_POSTGRES_DATABASE: zitadel
+      ZITADEL_DATABASE_POSTGRES_USER_USERNAME: postgres
+      ZITADEL_DATABASE_POSTGRES_USER_PASSWORD: postgres
+      ZITADEL_DATABASE_POSTGRES_USER_SSL_MODE: disable
+      ZITADEL_DATABASE_POSTGRES_ADMIN_USERNAME: postgres
+      ZITADEL_DATABASE_POSTGRES_ADMIN_PASSWORD: postgres
+      ZITADEL_DATABASE_POSTGRES_ADMIN_SSL_MODE: disable
+      ZITADEL_EXTERNALSECURE: "false"
+      ZITADEL_EXTERNALPORT: "8082"
+      ZITADEL_EXTERNALDOMAIN: localhost
+      ZITADEL_FIRSTINSTANCE_ORG_NAME: "POC Northern"
+      ZITADEL_FIRSTINSTANCE_ORG_HUMAN_USERNAME: admin
+      ZITADEL_FIRSTINSTANCE_ORG_HUMAN_PASSWORD: "Password1!"
+      ZITADEL_FIRSTINSTANCE_ORG_HUMAN_EMAIL_ADDRESS: admin@poc.local
+      ZITADEL_FIRSTINSTANCE_ORG_HUMAN_EMAIL_VERIFIED: "true"
+      ZITADEL_FIRSTINSTANCE_ORG_HUMAN_PASSWORDCHANGEREQUIRED: "false"
+      ZITADEL_FIRSTINSTANCE_ORG_MACHINE_MACHINE_USERNAME: zitadel-admin-sa
+      ZITADEL_FIRSTINSTANCE_ORG_MACHINE_MACHINE_NAME: Admin
+      ZITADEL_FIRSTINSTANCE_ORG_MACHINE_PAT_EXPIRATIONDATE: "9999-01-01T00:00:00Z"
+      ZITADEL_FIRSTINSTANCE_PATPATH: /pat/admin.pat
+      ZITADEL_DEFAULTINSTANCE_FEATURES_LOGINV2_REQUIRED: "false"
+    volumes:
+      - pat:/pat
+      - zitadel_data:/var/lib/zitadel
+    ports:
+      - "8082:8080"
+
+  zitadel-proxy:
+    image: nginx:alpine
+    volumes:
+      - ./nginx/zitadel-proxy.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - zitadel
+
+  # Phase 1: create Kratos identities + seed app DB (alice, eve, frank only)
   setup:
     image: node:20-alpine
     working_dir: /app
@@ -61,6 +113,26 @@ services:
       postgres:
         condition: service_healthy
 
+  # Phase 4: create Zitadel OIDC app + charlie/diana users + seed app DB
+  setup-zitadel:
+    image: node:20-alpine
+    working_dir: /app
+    volumes:
+      - ./scripts:/app
+      - zitadel-config:/zitadel-config
+      - pat:/pat
+    environment:
+      ZITADEL_URL: http://zitadel-proxy:8081
+      APP_DB_URL: postgres://postgres:postgres@postgres:5432/app
+    command: sh -c "npm install --prefer-offline && node setup-zitadel.js"
+    depends_on:
+      zitadel:
+        condition: service_started
+      zitadel-proxy:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+
   security-proxy:
     build: ./security-proxy
     environment:
@@ -70,12 +142,19 @@ services:
       HASURA_URL: http://hasura:8080/v1/graphql
       PORT: "3300"
       RUST_LOG: info
+      ZITADEL_CONFIG_FILE: /zitadel-config/zitadel.json
+      OIDC_CALLBACK_URL: http://localhost:3300/api/auth/callback
+      FRONTEND_URL: http://localhost:3301
+    volumes:
+      - zitadel-config:/zitadel-config:ro
     depends_on:
       postgres:
         condition: service_healthy
       kratos:
         condition: service_healthy
       setup:
+        condition: service_completed_successfully
+      setup-zitadel:
         condition: service_completed_successfully
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://localhost:3300/health || exit 1"]
@@ -128,3 +207,6 @@ services:
 
 volumes:
   postgres_data:
+  pat:
+  zitadel-config:
+  zitadel_data:

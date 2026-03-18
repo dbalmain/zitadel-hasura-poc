@@ -27,6 +27,8 @@ pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health", get(health::handler))
         .route("/.well-known/jwks.json", get(jwks::handler))
+        .route("/api/auth/init", post(auth::auth_init))
+        .route("/api/auth/callback", get(auth::auth_callback))
         .route("/api/login", post(auth::login))
         .route("/api/logout", post(auth::logout))
         .route("/api/me", get(auth::me))

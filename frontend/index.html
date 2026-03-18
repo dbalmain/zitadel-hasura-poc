@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <title>IDP POC — Phase 3</title>
+  <title>IDP POC — Phase 4</title>
   <style>
     body { font-family: system-ui, sans-serif; max-width: 860px; margin: 2rem auto; padding: 0 1rem; }
     pre  { background: #f4f4f4; padding: 1rem; border-radius: 4px; overflow: auto; font-size: .8rem; }
@@ -18,7 +18,7 @@
   </style>
 </head>
 <body>
-  <h1>IDP POC — Kratos + Rust Security Proxy + Hasura</h1>
+  <h1>IDP POC — Kratos + Zitadel + Rust Security Proxy + Hasura</h1>
   <div id="app">Loading config…</div>
 
 <script>
@@ -61,25 +61,70 @@ async function api(method, path, body) {
 let currentUser = null; // { user_id, email, active_role, active_branch_id }
 
 // ---------------------------------------------------------------------------
-// Screen: Login (default)
+// Screen: Login — Step 1: Email
 // ---------------------------------------------------------------------------
 function renderLogin(msg) {
   document.getElementById('app').innerHTML = `
     <div class="card">
       <h3>Login</h3>
+      <p>Step 1: Enter your email to continue.</p>
       <div>
         <input id="loginEmail" type="email" placeholder="Email" value="alice@poc.local" /><br>
-        <input id="loginPass" type="password" placeholder="Password" value="TestPassword1!" /><br>
-        <button onclick="doLogin()">Login</button>
+        <button onclick="doContinue()">Continue →</button>
       </div>
       <p id="loginMsg" class="${msg?.isError ? 'error' : 'ok'}">${msg?.text || ''}</p>
-      <p><a onclick="renderForgotPassword()">Forgot password?</a></p>
+      <p style="color:#888;font-size:.85em">
+        Kratos users: alice@poc.local, eve@poc.local, frank@poc.local<br>
+        Zitadel users: charlie@poc.northern.local, diana@poc.northern.local
+      </p>
+    </div>
+  `;
+}
+
+// Step 1: POST /api/auth/init to resolve IdP
+async function doContinue() {
+  const email = document.getElementById('loginEmail').value.trim();
+  const msgEl = document.getElementById('loginMsg');
+  msgEl.textContent = 'Checking…';
+  msgEl.className = '';
+  try {
+    const result = await api('POST', '/api/auth/init', { email });
+    if (result.type === 'credentials') {
+      renderPasswordStep(email);
+    } else if (result.type === 'redirect') {
+      msgEl.className = 'ok';
+      msgEl.textContent = 'Redirecting to Zitadel…';
+      window.location.href = result.url;
+    } else {
+      msgEl.className = 'error';
+      msgEl.textContent = 'Unexpected response from server';
+    }
+  } catch (e) {
+    msgEl.className = 'error';
+    msgEl.textContent = `Error: ${e.message}`;
+  }
+}
+
+// Step 2a: Password form for Kratos users
+function renderPasswordStep(email) {
+  document.getElementById('app').innerHTML = `
+    <div class="card">
+      <h3>Login</h3>
+      <p>Step 2: Enter your password.</p>
+      <div>
+        <input id="loginEmail2" type="email" value="${escapeHtml(email)}" readonly style="background:#f0f0f0" /><br>
+        <input id="loginPass" type="password" placeholder="Password" value="TestPassword1!" autofocus /><br>
+        <button onclick="doLogin()">Login</button>
+        <button onclick="renderLogin({})" style="background:none;border:none;color:#0066cc;cursor:pointer">← Back</button>
+      </div>
+      <p id="loginMsg"></p>
+      <p><button onclick="doForgotPasswordForEmail(document.getElementById('loginEmail2').value)">Forgot password?</button></p>
     </div>
   `;
 }
 
 async function doLogin() {
-  const email    = document.getElementById('loginEmail').value;
+  const email    = document.getElementById('loginEmail2').value;
   const password = document.getElementById('loginPass').value;
   const msgEl    = document.getElementById('loginMsg');
   msgEl.textContent = 'Logging in…';
@@ -93,8 +138,12 @@ async function doLogin() {
   }
 }
 
+function escapeHtml(str) {
+  return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
 // ---------------------------------------------------------------------------
-// Screen: Forgot Password (3-step flow)
+// Screen: Forgot Password (3-step flow — Kratos users only)
 // ---------------------------------------------------------------------------
 let recoveryToken = null;
 let resetToken = null;
@@ -103,13 +152,27 @@ function renderForgotPassword() {
   document.getElementById('app').innerHTML = `
     <div class="card">
       <h3>Forgot Password — Step 1: Enter Email</h3>
-      <p>A 6-digit recovery code will be sent to your email.</p>
+      <p>A 6-digit recovery code will be sent to your email.<br>
+         <em>Note: only available for Kratos users (@poc.local).</em></p>
       <input id="fpEmail" type="email" placeholder="Email" /><br>
       <button onclick="doForgotPassword()">Send Code</button>
       <p id="fpMsg"></p>
       <p><a onclick="renderLogin({})">Back to login</a></p>
     </div>
   `;
+}
+
+async function doForgotPasswordForEmail(email) {
+  renderForgotPasswordVerify();
+  document.getElementById('fpMsg').textContent = 'Sending code…';
+  try {
+    const data = await api('POST', '/api/forgot-password', { email });
+    recoveryToken = data.recovery_token;
+    document.getElementById('fpMsg').textContent = '';
+  } catch (e) {
+    document.getElementById('fpMsg').className = 'error';
+    document.getElementById('fpMsg').textContent = `Error: ${e.message}`;
+  }
 }
 
 async function doForgotPassword() {
@@ -285,7 +348,7 @@ async function init() {
   } catch (e) {
     document.getElementById('app').innerHTML =
       `<p class="error">${e.message}</p>
-       <p>Run <code>docker compose up</code> and wait for the setup service to print "=== Setup complete ===".</p>`;
+       <p>Run <code>docker compose up</code> and wait for setup services to complete.</p>`;
     return;
   }
 

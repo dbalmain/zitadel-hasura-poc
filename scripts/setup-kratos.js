@@ -1,5 +1,7 @@
 /**
  * Phase 1 setup — creates Kratos identities and seeds the app DB.
+ * Handles alice, eve, frank (Kratos users).
+ * Charlie and diana are Zitadel users, handled by setup-zitadel.js.
  * Runs after Kratos and Postgres are healthy.
  */
 
@@ -41,14 +43,19 @@ async function kratosAdmin(method, path, body) {
 }
 
 async function createIdentity(email, password) {
-  const identity = await kratosAdmin('POST', '/admin/identities', {
-    schema_id: 'default',
-    traits: { email },
-    credentials: {
-      password: { config: { password } },
-    },
-  });
-  return identity.id;
+  try {
+    const identity = await kratosAdmin('POST', '/admin/identities', {
+      schema_id: 'default',
+      traits: { email },
+      credentials: { password: { config: { password } } },
+    });
+    return identity.id;
+  } catch (err) {
+    if (!err.message.includes('409')) throw err;
+    // Already exists — find by credentials_identifier
+    const list = await kratosAdmin('GET', `/admin/identities?credentials_identifier=${encodeURIComponent(email)}`);
+    return list[0].id;
+  }
 }
 
 async function main() {
@@ -56,16 +63,15 @@ async function main() {
 
   await waitForKratos();
 
-  // Create Kratos identities and collect their UUIDs
+  // Create Kratos identities for Kratos-managed users only
+  // Charlie and diana are now Zitadel users (@poc.northern.local)
   const PASSWORD = 'TestPassword1!';
-  console.log('Creating Kratos identities...');
+  console.log('Creating Kratos identities (alice, eve, frank)...');
 
   const users = {
-    alice:   await createIdentity('alice@poc.local', PASSWORD),
-    charlie: await createIdentity('charlie@poc.local', PASSWORD),
-    diana:   await createIdentity('diana@poc.local', PASSWORD),
-    eve:     await createIdentity('eve@poc.local', PASSWORD),
-    frank:   await createIdentity('frank@poc.local', PASSWORD),
+    alice: await createIdentity('alice@poc.local', PASSWORD),
+    eve:   await createIdentity('eve@poc.local', PASSWORD),
+    frank: await createIdentity('frank@poc.local', PASSWORD),
   };
 
   console.log('✓ Identities created:');
@@ -77,40 +83,40 @@ async function main() {
   const db = new Client({ connectionString: APP_DB_URL });
   await db.connect();
 
-  console.log('\nSeeding app database...');
+  console.log('\nSeeding app database (Kratos users)...');
 
-  // Insert users (keyed by Kratos identity ID)
+  // Insert Kratos users (keyed by Kratos identity ID)
+  const kratosEmailMap = {
+    alice: 'alice@poc.local',
+    eve:   'eve@poc.local',
+    frank: 'frank@poc.local',
+  };
   for (const [name, id] of Object.entries(users)) {
-    const email = `${name}@poc.local`;
     await db.query(
       'INSERT INTO users (id, email) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING',
-      [id, email]
+      [id, kratosEmailMap[name]]
     );
   }
-  console.log('✓ Users inserted');
+  console.log('✓ Kratos users inserted');
 
-  // Insert role assignments:
+  // Insert role assignments for Kratos users:
   //
-  //  User    | branch-1                        | branch-2
-  //  --------|--------------------------------|--------------------------------
-  //  alice   | branch-coordinator, user        | branch-coordinator, user
-  //  charlie | user                            | —
-  //  diana   | user                            | —
-  //  eve     | —                               | user
-  //  frank   | —                               | branch-coordinator, user
+  //  User  | branch-1                        | branch-2
+  //  ------|--------------------------------|--------------------------------
+  //  alice | branch-coordinator, user        | branch-coordinator, user
+  //  eve   | —                               | user
+  //  frank | —                               | branch-coordinator, user
   //
-  // Role names use kebab-case (matches Hasura permission role names)
+  // Charlie and diana (branch-1 users) are seeded by setup-zitadel.js
 
   const roleAssignments = [
-    [users.alice,   'branch-1', 'branch-coordinator'],
-    [users.alice,   'branch-1', 'user'],
-    [users.alice,   'branch-2', 'branch-coordinator'],
-    [users.alice,   'branch-2', 'user'],
-    [users.charlie, 'branch-1', 'user'],
-    [users.diana,   'branch-1', 'user'],
-    [users.eve,     'branch-2', 'user'],
-    [users.frank,   'branch-2', 'branch-coordinator'],
-    [users.frank,   'branch-2', 'user'],
+    [users.alice, 'branch-1', 'branch-coordinator'],
+    [users.alice, 'branch-1', 'user'],
+    [users.alice, 'branch-2', 'branch-coordinator'],
+    [users.alice, 'branch-2', 'user'],
+    [users.eve,   'branch-2', 'user'],
+    [users.frank, 'branch-2', 'branch-coordinator'],
+    [users.frank, 'branch-2', 'user'],
   ];
 
   for (const [userId, branchId, role] of roleAssignments) {
@@ -130,14 +136,13 @@ async function main() {
   fs.writeFileSync('/frontend/config.json', JSON.stringify(config, null, 2));
   console.log('✓ Frontend config written');
 
-  console.log('\n=== Setup complete ===');
-  console.log('\nTest credentials (all passwords: TestPassword1!):');
+  console.log('\n=== Kratos setup complete ===');
+  console.log('\nKratos users (password: TestPassword1!):');
   console.log('  alice@poc.local   — branch-1 & branch-2 (coordinator + user)');
-  console.log('  charlie@poc.local — branch-1 (user)');
-  console.log('  diana@poc.local   — branch-1 (user)');
   console.log('  eve@poc.local     — branch-2 (user)');
   console.log('  frank@poc.local   — branch-2 (coordinator + user)');
-  console.log('\nMailpit web UI: http://localhost:8025');
+  console.log('\nZitadel users are set up by setup-zitadel.js');
+  console.log('Mailpit web UI: http://localhost:8025');
 }
 
 main().catch((err) => {

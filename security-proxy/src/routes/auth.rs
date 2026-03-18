@@ -1,5 +1,9 @@
 use anyhow::anyhow;
-use axum::{extract::State, Json};
+use axum::{
+    extract::{Query, State},
+    response::Redirect,
+    Json,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -9,8 +13,10 @@ use uuid::Uuid;
 use crate::{
     db,
     error::AppError,
+    idp::AuthFlow,
     session::{Session, SESSION_COOKIE_NAME},
     state::AppState,
+    zitadel,
 };
 
 // ---------------------------------------------------------------------------
@@ -45,7 +51,100 @@ fn clear_session_cookie() -> Cookie<'static> {
 }
 
 // ---------------------------------------------------------------------------
-// Login
+// Auth Init — resolves IdP from email domain
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct AuthInitRequest {
+    email: String,
+}
+
+pub async fn auth_init(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<AuthInitRequest>,
+) -> Result<Json<Value>, AppError> {
+    let provider = state.idp_registry.for_email(&body.email);
+    match provider.auth_flow() {
+        AuthFlow::Credentials => Ok(Json(json!({ "type": "credentials" }))),
+        AuthFlow::OidcRedirect => {
+            let (code_verifier, code_challenge) = zitadel::generate_pkce();
+            let oidc_state = Uuid::new_v4().to_string();
+            let provider_key = state.idp_registry.key_for_email(&body.email);
+            state
+                .oidc_states
+                .store(oidc_state.clone(), code_verifier, provider_key);
+            let url =
+                provider.authorize_url(&oidc_state, &code_challenge, &state.oidc_callback_url);
+            Ok(Json(json!({ "type": "redirect", "url": url })))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Auth Callback — OIDC authorization-code exchange
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct CallbackParams {
+    code: String,
+    state: String,
+}
+
+pub async fn auth_callback(
+    State(state): State<Arc<AppState>>,
+    cookies: Cookies,
+    Query(params): Query<CallbackParams>,
+) -> Result<Redirect, AppError> {
+    let oidc_entry = state
+        .oidc_states
+        .take(&params.state)
+        .ok_or_else(|| AppError::BadRequest("Invalid or expired OIDC state".to_string()))?;
+
+    let provider = state
+        .idp_registry
+        .by_key(&oidc_entry.provider_key)
+        .ok_or_else(|| {
+            AppError::Internal(anyhow!(
+                "unknown provider key: {}",
+                oidc_entry.provider_key
+            ))
+        })?;
+
+    let (user_id, access_token) = provider
+        .exchange_code(&params.code, &oidc_entry.code_verifier, &state.oidc_callback_url)
+        .await
+        .map_err(|e| AppError::BadRequest(format!("OIDC code exchange failed: {}", e)))?;
+
+    let user = db::get_user_by_id(&state.db, &user_id)
+        .await
+        .map_err(AppError::Internal)?
+        .ok_or_else(|| AppError::BadRequest("User not found in application database".to_string()))?;
+
+    let user_roles = db::get_user_roles(&state.db, &user.id)
+        .await
+        .map_err(AppError::Internal)?;
+    let default_role = user_roles
+        .first()
+        .ok_or_else(|| AppError::BadRequest("User has no roles assigned".to_string()))?;
+
+    let session_id = Uuid::new_v4().to_string();
+    db::create_session(
+        &state.db,
+        &session_id,
+        &user.id,
+        &default_role.role,
+        &default_role.branch_id,
+        Some(&access_token),
+    )
+    .await
+    .map_err(AppError::Internal)?;
+
+    cookies.add(make_session_cookie(session_id));
+    Ok(Redirect::to(&state.frontend_url))
+}
+
+// ---------------------------------------------------------------------------
+// Login (Kratos credentials only)
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
@@ -67,9 +166,15 @@ pub async fn login(
     cookies: Cookies,
     Json(body): Json<LoginRequest>,
 ) -> Result<Json<MeResponse>, AppError> {
-    let (identity_id, kratos_session_id) = state
-        .kratos
-        .login(&body.email, &body.password)
+    let provider = state.idp_registry.for_email(&body.email);
+    if let AuthFlow::OidcRedirect = provider.auth_flow() {
+        return Err(AppError::BadRequest(
+            "This account uses SSO login. Please use the Continue button.".to_string(),
+        ));
+    }
+
+    let (identity_id, kratos_session_id) = provider
+        .authenticate(&body.email, &body.password)
         .await
         .map_err(|e| AppError::BadRequest(e.to_string()))?;
 
@@ -114,8 +219,11 @@ pub async fn logout(
     if let Some(cookie) = cookies.get(SESSION_COOKIE_NAME) {
         let session_id = cookie.value().to_string();
         if let Ok(Some(session)) = db::get_session(&state.db, &session_id).await {
-            if let Some(ref kratos_sid) = session.kratos_session_id {
-                let _ = state.kratos.revoke_session(kratos_sid).await;
+            if let Some(ref ext_session_id) = session.kratos_session_id {
+                if let Ok(Some(user)) = db::get_user_by_id(&state.db, &session.user_id).await {
+                    let provider = state.idp_registry.for_email(&user.email);
+                    let _ = provider.revoke_session(ext_session_id).await;
+                }
             }
             let _ = db::delete_session(&state.db, &session_id).await;
         }
@@ -225,26 +333,18 @@ pub async fn forgot_password(
     Json(body): Json<ForgotPasswordRequest>,
 ) -> Json<Value> {
     let recovery_token = Uuid::new_v4().to_string();
+    let provider = state.idp_registry.for_email(&body.email);
+    let flow_state_result = provider.begin_recovery(&body.email).await;
 
-    let action_url_result: anyhow::Result<String> = async {
-        let action_url = state.kratos.start_recovery().await?;
-        let updated_action = state
-            .kratos
-            .submit_recovery_email(&action_url, &body.email)
-            .await?;
-        Ok(updated_action)
-    }
-    .await;
-
-    match action_url_result {
-        Ok(action_url) => {
+    match flow_state_result {
+        Ok(flow_state) => {
             state
                 .recovery_store
-                .store_recovery(recovery_token.clone(), action_url, body.email.clone());
+                .store_recovery(recovery_token.clone(), flow_state, body.email.clone());
         }
         Err(e) => {
             tracing::warn!("Recovery flow error (suppressed for enumeration safety): {}", e);
-            // Store an empty action_url — verify step will return a generic error
+            // Store an empty flow_state — verify step will return a generic error
             state
                 .recovery_store
                 .store_recovery(recovery_token.clone(), String::new(), body.email.clone());
@@ -273,28 +373,23 @@ pub async fn forgot_password_verify(
         .take_recovery(&body.recovery_token)
         .ok_or_else(|| AppError::BadRequest("Invalid or expired recovery token".to_string()))?;
 
-    if entry.action_url.is_empty() {
-        return Err(AppError::BadRequest(
-            "Invalid recovery code".to_string(),
-        ));
+    if entry.flow_state.is_empty() {
+        return Err(AppError::BadRequest("Invalid recovery code".to_string()));
     }
 
-    state
-        .kratos
-        .submit_recovery_code(&entry.action_url, &body.code)
+    let provider = state.idp_registry.for_email(&entry.email);
+    provider
+        .verify_recovery_code(&entry.flow_state, &body.code)
         .await
         .map_err(|e| AppError::BadRequest(e.to_string()))?;
 
-    // Look up user by email to get the Kratos identity UUID
     let user = db::get_user_by_email(&state.db, &entry.email)
         .await
         .map_err(AppError::Internal)?
         .ok_or_else(|| AppError::BadRequest("User not found".to_string()))?;
 
     let reset_token = Uuid::new_v4().to_string();
-    state
-        .recovery_store
-        .store_reset(reset_token.clone(), user.id);
+    state.recovery_store.store_reset(reset_token.clone(), user.id);
 
     Ok(Json(json!({ "reset_token": reset_token })))
 }
@@ -318,15 +413,14 @@ pub async fn forgot_password_reset(
         .take_reset(&body.reset_token)
         .ok_or_else(|| AppError::BadRequest("Invalid or expired reset token".to_string()))?;
 
-    // Look up email for the user (needed by admin API to preserve traits)
     let user = db::get_user_by_id(&state.db, &entry.user_id)
         .await
         .map_err(AppError::Internal)?
         .ok_or_else(|| AppError::Internal(anyhow!("user not found")))?;
 
-    state
-        .kratos
-        .admin_set_password(&entry.user_id, &user.email, &body.new_password)
+    let provider = state.idp_registry.for_email(&user.email);
+    provider
+        .set_password(&entry.user_id, &user.email, &body.new_password)
         .await
         .map_err(|e| AppError::BadRequest(e.to_string()))?;
 

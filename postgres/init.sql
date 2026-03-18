@@ -1,6 +1,7 @@
 -- Create databases
 CREATE DATABASE app;
 CREATE DATABASE kratos;  -- Managed entirely by Kratos
+CREATE DATABASE zitadel;  -- Managed entirely by Zitadel
 
 \c app
 
